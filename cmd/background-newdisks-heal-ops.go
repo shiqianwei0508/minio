@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2019 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
@@ -29,11 +30,11 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
+	"github.com/minio/madmin-go"
 	"github.com/minio/minio-go/v7/pkg/set"
-	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/pkg/color"
-	"github.com/minio/minio/pkg/console"
-	"github.com/minio/minio/pkg/madmin"
+	"github.com/minio/minio/internal/color"
+	"github.com/minio/minio/internal/logger"
+	"github.com/minio/pkg/console"
 )
 
 const (
@@ -47,18 +48,23 @@ const (
 type healingTracker struct {
 	disk StorageAPI `msg:"-"`
 
-	ID            string
-	PoolIndex     int
-	SetIndex      int
-	DiskIndex     int
-	Path          string
-	Endpoint      string
-	Started       time.Time
-	LastUpdate    time.Time
-	ObjectsHealed uint64
-	ObjectsFailed uint64
-	BytesDone     uint64
-	BytesFailed   uint64
+	ID         string
+	PoolIndex  int
+	SetIndex   int
+	DiskIndex  int
+	Path       string
+	Endpoint   string
+	Started    time.Time
+	LastUpdate time.Time
+
+	ObjectsTotalCount uint64
+	ObjectsTotalSize  uint64
+
+	ItemsHealed uint64
+	ItemsFailed uint64
+
+	BytesDone   uint64
+	BytesFailed uint64
 
 	// Last object scanned.
 	Bucket string `json:"-"`
@@ -66,10 +72,10 @@ type healingTracker struct {
 
 	// Numbers when current bucket started healing,
 	// for resuming with correct numbers.
-	ResumeObjectsHealed uint64 `json:"-"`
-	ResumeObjectsFailed uint64 `json:"-"`
-	ResumeBytesDone     uint64 `json:"-"`
-	ResumeBytesFailed   uint64 `json:"-"`
+	ResumeItemsHealed uint64 `json:"-"`
+	ResumeItemsFailed uint64 `json:"-"`
+	ResumeBytesDone   uint64 `json:"-"`
+	ResumeBytesFailed uint64 `json:"-"`
 
 	// Filled on startup/restarts.
 	QueuedBuckets []string
@@ -174,8 +180,8 @@ func (h *healingTracker) isHealed(bucket string) bool {
 
 // resume will reset progress to the numbers at the start of the bucket.
 func (h *healingTracker) resume() {
-	h.ObjectsHealed = h.ResumeObjectsHealed
-	h.ObjectsFailed = h.ResumeObjectsFailed
+	h.ItemsHealed = h.ResumeItemsHealed
+	h.ItemsFailed = h.ResumeItemsFailed
 	h.BytesDone = h.ResumeBytesDone
 	h.BytesFailed = h.ResumeBytesFailed
 }
@@ -183,8 +189,8 @@ func (h *healingTracker) resume() {
 // bucketDone should be called when a bucket is done healing.
 // Adds the bucket to the list of healed buckets and updates resume numbers.
 func (h *healingTracker) bucketDone(bucket string) {
-	h.ResumeObjectsHealed = h.ObjectsHealed
-	h.ResumeObjectsFailed = h.ObjectsFailed
+	h.ResumeItemsHealed = h.ItemsHealed
+	h.ResumeItemsFailed = h.ItemsFailed
 	h.ResumeBytesDone = h.BytesDone
 	h.ResumeBytesFailed = h.BytesFailed
 	h.HealedBuckets = append(h.HealedBuckets, bucket)
@@ -219,22 +225,28 @@ func (h *healingTracker) printTo(writer io.Writer) {
 // toHealingDisk converts the information to madmin.HealingDisk
 func (h *healingTracker) toHealingDisk() madmin.HealingDisk {
 	return madmin.HealingDisk{
-		ID:            h.ID,
-		Endpoint:      h.Endpoint,
-		PoolIndex:     h.PoolIndex,
-		SetIndex:      h.SetIndex,
-		DiskIndex:     h.DiskIndex,
-		Path:          h.Path,
-		Started:       h.Started.UTC(),
-		LastUpdate:    h.LastUpdate.UTC(),
-		ObjectsHealed: h.ObjectsHealed,
-		ObjectsFailed: h.ObjectsFailed,
-		BytesDone:     h.BytesDone,
-		BytesFailed:   h.BytesFailed,
-		Bucket:        h.Bucket,
-		Object:        h.Object,
-		QueuedBuckets: h.QueuedBuckets,
-		HealedBuckets: h.HealedBuckets,
+		ID:                h.ID,
+		Endpoint:          h.Endpoint,
+		PoolIndex:         h.PoolIndex,
+		SetIndex:          h.SetIndex,
+		DiskIndex:         h.DiskIndex,
+		Path:              h.Path,
+		Started:           h.Started.UTC(),
+		LastUpdate:        h.LastUpdate.UTC(),
+		ObjectsTotalCount: h.ObjectsTotalCount,
+		ObjectsTotalSize:  h.ObjectsTotalSize,
+		ItemsHealed:       h.ItemsHealed,
+		ItemsFailed:       h.ItemsFailed,
+		BytesDone:         h.BytesDone,
+		BytesFailed:       h.BytesFailed,
+		Bucket:            h.Bucket,
+		Object:            h.Object,
+		QueuedBuckets:     h.QueuedBuckets,
+		HealedBuckets:     h.HealedBuckets,
+
+		ObjectsHealed: h.ItemsHealed, // Deprecated July 2021
+		ObjectsFailed: h.ItemsFailed, // Deprecated July 2021
+
 	}
 }
 
@@ -339,7 +351,7 @@ func monitorLocalDisksAndHeal(ctx context.Context, z *erasureServerPools, bgSeq 
 				}
 			}
 
-			if serverDebugLog {
+			if serverDebugLog && len(healDisks) > 0 {
 				console.Debugf(color.Green("healDisk:")+" disk check timer fired, attempting to heal %d drives\n", len(healDisks))
 			}
 
@@ -410,6 +422,14 @@ func monitorLocalDisksAndHeal(ctx context.Context, z *erasureServerPools, bgSeq 
 							if err != nil {
 								logger.Info("Healing tracker missing on '%s', disk was swapped again on %s pool", disk, humanize.Ordinal(i+1))
 								tracker = newHealingTracker(disk)
+							}
+
+							// Load bucket totals
+							cache := dataUsageCache{}
+							if err := cache.load(ctx, z.serverPools[i].sets[setIndex], dataUsageCacheName); err == nil {
+								dataUsageInfo := cache.dui(dataUsageRoot, nil)
+								tracker.ObjectsTotalCount = dataUsageInfo.ObjectsTotalCount
+								tracker.ObjectsTotalSize = dataUsageInfo.ObjectsTotalSize
 							}
 
 							tracker.PoolIndex, tracker.SetIndex, tracker.DiskIndex = disk.GetDiskLoc()

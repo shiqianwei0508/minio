@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2019 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
@@ -23,11 +24,11 @@ import (
 	"sort"
 	"time"
 
-	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/pkg/color"
-	"github.com/minio/minio/pkg/console"
-	"github.com/minio/minio/pkg/madmin"
-	"github.com/minio/minio/pkg/wildcard"
+	"github.com/minio/madmin-go"
+	"github.com/minio/minio/internal/color"
+	"github.com/minio/minio/internal/logger"
+	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/wildcard"
 )
 
 const (
@@ -67,6 +68,17 @@ func newBgHealSequence() *healSequence {
 	}
 }
 
+func getCurrentMRFStatus() madmin.MRFStatus {
+	mrfInfo := globalMRFState.getCurrentMRFRoundInfo()
+	return madmin.MRFStatus{
+		BytesHealed: mrfInfo.bytesHealed,
+		ItemsHealed: mrfInfo.itemsHealed,
+		TotalItems:  mrfInfo.itemsHealed + mrfInfo.pendingItems,
+		TotalBytes:  mrfInfo.bytesHealed + mrfInfo.pendingBytes,
+		Started:     mrfInfo.triggeredAt,
+	}
+}
+
 // getBackgroundHealStatus will return the
 func getBackgroundHealStatus(ctx context.Context, o ObjectLayer) (madmin.BgHealState, bool) {
 	if globalBackgroundHealState == nil {
@@ -78,12 +90,19 @@ func getBackgroundHealStatus(ctx context.Context, o ObjectLayer) (madmin.BgHealS
 		return madmin.BgHealState{}, false
 	}
 
+	status := madmin.BgHealState{
+		ScannedItemsCount: bgSeq.getScannedItemsCount(),
+	}
+
+	if globalMRFState != nil {
+		status.MRF = map[string]madmin.MRFStatus{
+			globalLocalNodeName: getCurrentMRFStatus(),
+		}
+	}
+
 	var healDisksMap = map[string]struct{}{}
 	for _, ep := range getLocalDisksToHeal() {
 		healDisksMap[ep.String()] = struct{}{}
-	}
-	status := madmin.BgHealState{
-		ScannedItemsCount: bgSeq.getScannedItemsCount(),
 	}
 
 	if o == nil {
@@ -157,13 +176,6 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []BucketIn
 		Name: pathJoin(minioMetaBucket, minioConfigPrefix),
 	})
 
-	// Try to pro-actively heal backend-encrypted file.
-	if _, err := er.HealObject(ctx, minioMetaBucket, backendEncryptedFile, "", madmin.HealOpts{}); err != nil {
-		if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
-			logger.LogIf(ctx, err)
-		}
-	}
-
 	// Heal all buckets with all objects
 	for _, bucket := range buckets {
 		if tracker.isHealed(bucket.Name) {
@@ -231,12 +243,12 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []BucketIn
 					ScanMode: madmin.HealNormalScan, Remove: healDeleteDangling}); err != nil {
 					if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
 						// If not deleted, assume they failed.
-						tracker.ObjectsFailed++
+						tracker.ItemsFailed++
 						tracker.BytesFailed += uint64(version.Size)
 						logger.LogIf(ctx, err)
 					}
 				} else {
-					tracker.ObjectsHealed++
+					tracker.ItemsHealed++
 					tracker.BytesDone += uint64(version.Size)
 				}
 				bgSeq.logHeal(madmin.HealItemObject)

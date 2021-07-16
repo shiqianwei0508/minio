@@ -1,47 +1,50 @@
-/*
- * MinIO Cloud Storage, (C) 2016-2019 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
 import (
 	"context"
-	"crypto/tls"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 
-	"github.com/minio/minio/cmd/config"
-	"github.com/minio/minio/cmd/config/api"
-	"github.com/minio/minio/cmd/config/cache"
-	"github.com/minio/minio/cmd/config/compress"
-	"github.com/minio/minio/cmd/config/dns"
-	"github.com/minio/minio/cmd/config/etcd"
-	"github.com/minio/minio/cmd/config/heal"
-	xldap "github.com/minio/minio/cmd/config/identity/ldap"
-	"github.com/minio/minio/cmd/config/identity/openid"
-	"github.com/minio/minio/cmd/config/notify"
-	"github.com/minio/minio/cmd/config/policy/opa"
-	"github.com/minio/minio/cmd/config/scanner"
-	"github.com/minio/minio/cmd/config/storageclass"
-	"github.com/minio/minio/cmd/crypto"
-	xhttp "github.com/minio/minio/cmd/http"
-	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/cmd/logger/target/http"
-	"github.com/minio/minio/pkg/env"
-	"github.com/minio/minio/pkg/madmin"
+	"github.com/minio/madmin-go"
+	"github.com/minio/minio/internal/config"
+	"github.com/minio/minio/internal/config/api"
+	"github.com/minio/minio/internal/config/cache"
+	"github.com/minio/minio/internal/config/compress"
+	"github.com/minio/minio/internal/config/dns"
+	"github.com/minio/minio/internal/config/etcd"
+	"github.com/minio/minio/internal/config/heal"
+	xldap "github.com/minio/minio/internal/config/identity/ldap"
+	"github.com/minio/minio/internal/config/identity/openid"
+	"github.com/minio/minio/internal/config/notify"
+	"github.com/minio/minio/internal/config/policy/opa"
+	"github.com/minio/minio/internal/config/scanner"
+	"github.com/minio/minio/internal/config/storageclass"
+	"github.com/minio/minio/internal/crypto"
+	xhttp "github.com/minio/minio/internal/http"
+	"github.com/minio/minio/internal/kms"
+	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/logger/target/http"
+	"github.com/minio/minio/internal/logger/target/kafka"
+	"github.com/minio/pkg/env"
 )
 
 func initHelp() {
@@ -55,10 +58,9 @@ func initHelp() {
 		config.RegionSubSys:         config.DefaultRegionKVS,
 		config.APISubSys:            api.DefaultKVS,
 		config.CredentialsSubSys:    config.DefaultCredentialKVS,
-		config.KmsVaultSubSys:       crypto.DefaultVaultKVS,
-		config.KmsKesSubSys:         crypto.DefaultKesKVS,
 		config.LoggerWebhookSubSys:  logger.DefaultKVS,
-		config.AuditWebhookSubSys:   logger.DefaultAuditKVS,
+		config.AuditWebhookSubSys:   logger.DefaultAuditWebhookKVS,
+		config.AuditKafkaSubSys:     logger.DefaultAuditKafkaKVS,
 		config.HealSubSys:           heal.DefaultKVS,
 		config.ScannerSubSys:        scanner.DefaultKVS,
 	}
@@ -101,14 +103,6 @@ func initHelp() {
 			Description: "[DEPRECATED] enable external OPA for policy enforcement",
 		},
 		config.HelpKV{
-			Key:         config.KmsVaultSubSys,
-			Description: "enable external HashiCorp Vault key management service",
-		},
-		config.HelpKV{
-			Key:         config.KmsKesSubSys,
-			Description: "enable external MinIO key encryption service",
-		},
-		config.HelpKV{
 			Key:         config.APISubSys,
 			Description: "manage global HTTP API call specific features, such as throttling, authentication types, etc.",
 		},
@@ -128,6 +122,11 @@ func initHelp() {
 		config.HelpKV{
 			Key:             config.AuditWebhookSubSys,
 			Description:     "send audit logs to webhook endpoints",
+			MultipleTargets: true,
+		},
+		config.HelpKV{
+			Key:             config.AuditKafkaSubSys,
+			Description:     "send audit logs to kafka endpoints",
 			MultipleTargets: true,
 		},
 		config.HelpKV{
@@ -204,10 +203,9 @@ func initHelp() {
 		config.IdentityOpenIDSubSys: openid.Help,
 		config.IdentityLDAPSubSys:   xldap.Help,
 		config.PolicyOPASubSys:      opa.Help,
-		config.KmsVaultSubSys:       crypto.HelpVault,
-		config.KmsKesSubSys:         crypto.HelpKes,
 		config.LoggerWebhookSubSys:  logger.Help,
-		config.AuditWebhookSubSys:   logger.HelpAudit,
+		config.AuditWebhookSubSys:   logger.HelpWebhook,
+		config.AuditKafkaSubSys:     logger.HelpKafka,
 		config.NotifyAMQPSubSys:     notify.HelpAMQP,
 		config.NotifyKafkaSubSys:    notify.HelpKafka,
 		config.NotifyMQTTSubSys:     notify.HelpMQTT,
@@ -295,27 +293,6 @@ func validateConfig(s config.Config, setDriveCounts []int) error {
 			etcdClnt.Close()
 		}
 	}
-	{
-		kmsCfg, err := crypto.LookupConfig(s, globalCertsCADir.Get(), newCustomHTTPTransportWithHTTP2(
-			&tls.Config{
-				RootCAs: globalRootCAs,
-			}, defaultDialTimeout)())
-		if err != nil {
-			return err
-		}
-
-		// Set env to enable master key validation.
-		// this is needed only for KMS.
-		env.SetEnvOn()
-
-		if _, err = crypto.NewKMS(kmsCfg); err != nil {
-			return err
-		}
-
-		// Disable merging env values for the rest.
-		env.SetEnvOff()
-	}
-
 	if _, err := openid.LookupConfig(s[config.IdentityOpenIDSubSys][config.Default],
 		NewGatewayHTTPTransport(), xhttp.DrainBody); err != nil {
 		return err
@@ -467,33 +444,17 @@ func lookupConfigs(s config.Config, setDriveCounts []int) {
 	}
 
 	if globalCacheConfig.Enabled {
-		if cacheEncKey := env.Get(cache.EnvCacheEncryptionMasterKey, ""); cacheEncKey != "" {
-			globalCacheKMS, err = crypto.ParseMasterKey(cacheEncKey)
+		if cacheEncKey := env.Get(cache.EnvCacheEncryptionKey, ""); cacheEncKey != "" {
+			globalCacheKMS, err = kms.Parse(cacheEncKey)
 			if err != nil {
 				logger.LogIf(ctx, fmt.Errorf("Unable to setup encryption cache: %w", err))
 			}
 		}
 	}
 
-	kmsCfg, err := crypto.LookupConfig(s, globalCertsCADir.Get(), newCustomHTTPTransportWithHTTP2(
-		&tls.Config{
-			RootCAs: globalRootCAs,
-		}, defaultDialTimeout)())
-	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to setup KMS config: %w", err))
-	}
-
-	GlobalKMS, err = crypto.NewKMS(kmsCfg)
-	if err != nil {
-		logger.LogIf(ctx, fmt.Errorf("Unable to setup KMS with current KMS config: %w", err))
-	}
-	globalAutoEncryption = kmsCfg.AutoEncryption // Enable auto-encryption if enabled
-
-	if kmsCfg.Vault.Enabled {
-		const deprecationWarning = `Native Hashicorp Vault support is deprecated and will be removed on 2021-10-01. Please migrate to KES + Hashicorp Vault: https://github.com/minio/kes/wiki/Hashicorp-Vault-Keystore
-Note that native Hashicorp Vault and KES + Hashicorp Vault are not compatible.
-If you need help to migrate smoothly visit: https://min.io/pricing`
-		logger.LogIf(ctx, fmt.Errorf(deprecationWarning))
+	globalAutoEncryption = crypto.LookupAutoEncryption() // Enable auto-encryption if enabled
+	if globalAutoEncryption && GlobalKMS == nil {
+		logger.Fatal(errors.New("no KMS configured"), "MINIO_KMS_AUTO_ENCRYPTION requires a valid KMS configuration")
 	}
 
 	globalOpenIDConfig, err = openid.LookupConfig(s[config.IdentityOpenIDSubSys][config.Default],
@@ -525,38 +486,36 @@ If you need help to migrate smoothly visit: https://min.io/pricing`
 		logger.LogIf(ctx, fmt.Errorf("Unable to initialize logger: %w", err))
 	}
 
-	for k, l := range loggerCfg.HTTP {
+	for _, l := range loggerCfg.HTTP {
 		if l.Enabled {
+			l.LogOnce = logger.LogOnceIf
+			l.UserAgent = loggerUserAgent
+			l.Transport = NewGatewayHTTPTransportWithClientCerts(l.ClientCert, l.ClientKey)
 			// Enable http logging
-			if err = logger.AddTarget(
-				http.New(
-					http.WithTargetName(k),
-					http.WithEndpoint(l.Endpoint),
-					http.WithAuthToken(l.AuthToken),
-					http.WithUserAgent(loggerUserAgent),
-					http.WithLogKind(string(logger.All)),
-					http.WithTransport(NewGatewayHTTPTransport()),
-				),
-			); err != nil {
+			if err = logger.AddTarget(http.New(l)); err != nil {
 				logger.LogIf(ctx, fmt.Errorf("Unable to initialize console HTTP target: %w", err))
 			}
 		}
 	}
 
-	for k, l := range loggerCfg.Audit {
+	for _, l := range loggerCfg.AuditWebhook {
 		if l.Enabled {
+			l.LogOnce = logger.LogOnceIf
+			l.UserAgent = loggerUserAgent
+			l.Transport = NewGatewayHTTPTransportWithClientCerts(l.ClientCert, l.ClientKey)
 			// Enable http audit logging
-			if err = logger.AddAuditTarget(
-				http.New(
-					http.WithTargetName(k),
-					http.WithEndpoint(l.Endpoint),
-					http.WithAuthToken(l.AuthToken),
-					http.WithUserAgent(loggerUserAgent),
-					http.WithLogKind(string(logger.All)),
-					http.WithTransport(NewGatewayHTTPTransportWithClientCerts(l.ClientCert, l.ClientKey)),
-				),
-			); err != nil {
+			if err = logger.AddAuditTarget(http.New(l)); err != nil {
 				logger.LogIf(ctx, fmt.Errorf("Unable to initialize audit HTTP target: %w", err))
+			}
+		}
+	}
+
+	for _, l := range loggerCfg.AuditKafka {
+		if l.Enabled {
+			l.LogOnce = logger.LogOnceIf
+			// Enable Kafka audit logging
+			if err = logger.AddAuditTarget(kafka.New(l)); err != nil {
+				logger.LogIf(ctx, fmt.Errorf("Unable to initialize audit Kafka target: %w", err))
 			}
 		}
 	}
@@ -764,8 +723,8 @@ func loadConfig(objAPI ObjectLayer) error {
 func getOpenIDValidators(cfg openid.Config) *openid.Validators {
 	validators := openid.NewValidators()
 
-	if cfg.JWKS.URL != nil {
-		validators.Add(openid.NewJWT(cfg))
+	if cfg.Enabled {
+		validators.Add(&cfg)
 	}
 
 	return validators
