@@ -95,6 +95,14 @@ func SetNotifyKafka(s config.Config, name string, cfg target.KafkaArgs) error {
 			Key:   target.KafkaSASLPassword,
 			Value: cfg.SASL.Password,
 		},
+		config.KV{
+			Key:   target.KafkaCompressionCodec,
+			Value: cfg.Producer.Compression,
+		},
+		config.KV{
+			Key:   target.KafkaCompressionLevel,
+			Value: strconv.Itoa(cfg.Producer.CompressionLevel),
+		},
 	}
 	return nil
 }
@@ -241,6 +249,10 @@ func SetNotifyRedis(s config.Config, redisName string, cfg target.RedisArgs) err
 		config.KV{
 			Key:   target.RedisPassword,
 			Value: cfg.Password,
+		},
+		config.KV{
+			Key:   target.RedisUser,
+			Value: cfg.User,
 		},
 		config.KV{
 			Key:   target.RedisKey,
@@ -439,12 +451,20 @@ func SetNotifyNATS(s config.Config, natsName string, cfg target.NATSArgs) error 
 			Value: cfg.Username,
 		},
 		config.KV{
+			Key:   target.NATSUserCredentials,
+			Value: cfg.UserCredentials,
+		},
+		config.KV{
 			Key:   target.NATSPassword,
 			Value: cfg.Password,
 		},
 		config.KV{
 			Key:   target.NATSToken,
 			Value: cfg.Token,
+		},
+		config.KV{
+			Key:   target.NATSNKeySeed,
+			Value: cfg.NKeySeed,
 		},
 		config.KV{
 			Key:   target.NATSCertAuthority,
@@ -465,6 +485,10 @@ func SetNotifyNATS(s config.Config, natsName string, cfg target.NATSArgs) error 
 		config.KV{
 			Key:   target.NATSTLSSkipVerify,
 			Value: config.FormatBool(cfg.Secure),
+		},
+		config.KV{
+			Key:   target.NATSTLSHandshakeFirst,
+			Value: config.FormatBool(cfg.TLSHandshakeFirst),
 		},
 		config.KV{
 			Key:   target.NATSPingInterval,

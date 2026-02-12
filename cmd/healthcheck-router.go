@@ -20,7 +20,7 @@ package cmd
 import (
 	"net/http"
 
-	"github.com/gorilla/mux"
+	"github.com/minio/mux"
 )
 
 const (
@@ -34,7 +34,6 @@ const (
 
 // registerHealthCheckRouter - add handler functions for liveness and readiness routes.
 func registerHealthCheckRouter(router *mux.Router) {
-
 	// Healthcheck router
 	healthRouter := router.PathPrefix(healthCheckPathPrefix).Subrouter()
 

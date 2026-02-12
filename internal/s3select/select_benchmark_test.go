@@ -20,8 +20,6 @@ package s3select
 import (
 	"bytes"
 	"encoding/csv"
-	"io"
-	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"strconv"
@@ -48,7 +46,7 @@ func genSampleCSVData(count int) []byte {
 	csvWriter := csv.NewWriter(buf)
 	csvWriter.Write([]string{"id", "name", "age", "city"})
 
-	for i := 0; i < count; i++ {
+	for i := range count {
 		csvWriter.Write([]string{
 			strconv.Itoa(i),
 			newRandString(10),
@@ -61,8 +59,7 @@ func genSampleCSVData(count int) []byte {
 	return buf.Bytes()
 }
 
-type nullResponseWriter struct {
-}
+type nullResponseWriter struct{}
 
 func (w *nullResponseWriter) Header() http.Header {
 	return nil
@@ -79,7 +76,7 @@ func (w *nullResponseWriter) Flush() {
 }
 
 func benchmarkSelect(b *testing.B, count int, query string) {
-	var requestXML = []byte(`
+	requestXML := []byte(`
 <?xml version="1.0" encoding="UTF-8"?>
 <SelectObjectContentRequest>
     <Expression>` + query + `</Expression>
@@ -113,9 +110,7 @@ func benchmarkSelect(b *testing.B, count int, query string) {
 				b.Fatal(err)
 			}
 
-			if err = s3Select.Open(func(offset, length int64) (io.ReadCloser, error) {
-				return ioutil.NopCloser(bytes.NewReader(csvData)), nil
-			}); err != nil {
+			if err = s3Select.Open(newBytesRSC(csvData)); err != nil {
 				b.Fatal(err)
 			}
 

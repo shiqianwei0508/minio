@@ -21,6 +21,8 @@ import (
 	"context"
 	"io"
 	"time"
+
+	"github.com/minio/madmin-go/v3"
 )
 
 // StorageAPI interface.
@@ -29,21 +31,42 @@ type StorageAPI interface {
 	String() string
 
 	// Storage operations.
-	IsOnline() bool      // Returns true if disk is online.
-	LastConn() time.Time // Returns the last time this disk (re)-connected
 
+	// Returns true if disk is online and its valid i.e valid format.json.
+	// This has nothing to do with if the drive is hung or not responding.
+	// For that individual storage API calls will fail properly. The purpose
+	// of this function is to know if the "drive" has "format.json" or not
+	// if it has a "format.json" then is it correct "format.json" or not.
+	IsOnline() bool
+
+	// Returns the last time this disk (re)-connected
+	LastConn() time.Time
+
+	// Indicates if disk is local or not.
 	IsLocal() bool
 
-	Hostname() string   // Returns host name if remote host.
-	Endpoint() Endpoint // Returns endpoint.
+	// Returns hostname if disk is remote.
+	Hostname() string
 
+	// Returns the entire endpoint.
+	Endpoint() Endpoint
+
+	// Close the disk, mark it purposefully closed, only implemented for remote disks.
 	Close() error
-	GetDiskID() (string, error)
-	SetDiskID(id string)
-	Healing() *healingTracker // Returns nil if disk is not healing.
 
-	DiskInfo(ctx context.Context) (info DiskInfo, err error)
-	NSScanner(ctx context.Context, cache dataUsageCache, updates chan<- dataUsageEntry) (dataUsageCache, error)
+	// Returns the unique 'uuid' of this disk.
+	GetDiskID() (string, error)
+
+	// Set a unique 'uuid' for this disk, only used when
+	// disk is replaced and formatted.
+	SetDiskID(id string)
+
+	// Returns healing information for a newly replaced disk,
+	// returns 'nil' once healing is complete or if the disk
+	// has never been replaced.
+	Healing() *healingTracker
+	DiskInfo(ctx context.Context, opts DiskInfoOptions) (info DiskInfo, err error)
+	NSScanner(ctx context.Context, cache dataUsageCache, updates chan<- dataUsageEntry, scanMode madmin.HealScanMode, shouldSleep func() bool) (dataUsageCache, error)
 
 	// Volume operations.
 	MakeVol(ctx context.Context, volume string) (err error)
@@ -56,24 +79,30 @@ type StorageAPI interface {
 	WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writer) error
 
 	// Metadata operations
-	DeleteVersion(ctx context.Context, volume, path string, fi FileInfo, forceDelMarker bool) error
-	DeleteVersions(ctx context.Context, volume string, versions []FileInfo) []error
-	WriteMetadata(ctx context.Context, volume, path string, fi FileInfo) error
-	UpdateMetadata(ctx context.Context, volume, path string, fi FileInfo) error
-	ReadVersion(ctx context.Context, volume, path, versionID string, readData bool) (FileInfo, error)
-	RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string) error
+	DeleteVersion(ctx context.Context, volume, path string, fi FileInfo, forceDelMarker bool, opts DeleteOptions) error
+	DeleteVersions(ctx context.Context, volume string, versions []FileInfoVersions, opts DeleteOptions) []error
+	DeleteBulk(ctx context.Context, volume string, paths ...string) error
+	WriteMetadata(ctx context.Context, origvolume, volume, path string, fi FileInfo) error
+	UpdateMetadata(ctx context.Context, volume, path string, fi FileInfo, opts UpdateMetadataOpts) error
+	ReadVersion(ctx context.Context, origvolume, volume, path, versionID string, opts ReadOptions) (FileInfo, error)
+	ReadXL(ctx context.Context, volume, path string, readData bool) (RawFileInfo, error)
+	RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string, opts RenameOptions) (RenameDataResp, error)
 
 	// File operations.
-	ListDir(ctx context.Context, volume, dirPath string, count int) ([]string, error)
+	ListDir(ctx context.Context, origvolume, volume, dirPath string, count int) ([]string, error)
 	ReadFile(ctx context.Context, volume string, path string, offset int64, buf []byte, verifier *BitrotVerifier) (n int64, err error)
 	AppendFile(ctx context.Context, volume string, path string, buf []byte) (err error)
-	CreateFile(ctx context.Context, volume, path string, size int64, reader io.Reader) error
+	CreateFile(ctx context.Context, origvolume, olume, path string, size int64, reader io.Reader) error
 	ReadFileStream(ctx context.Context, volume, path string, offset, length int64) (io.ReadCloser, error)
 	RenameFile(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string) error
-	CheckParts(ctx context.Context, volume string, path string, fi FileInfo) error
-	Delete(ctx context.Context, volume string, path string, recursive bool) (err error)
-	VerifyFile(ctx context.Context, volume, path string, fi FileInfo) error
-	StatInfoFile(ctx context.Context, volume, path string) (stat StatInfo, err error)
+	RenamePart(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string, meta []byte, skipParent string) error
+	CheckParts(ctx context.Context, volume string, path string, fi FileInfo) (*CheckPartsResp, error)
+	Delete(ctx context.Context, volume string, path string, opts DeleteOptions) (err error)
+	VerifyFile(ctx context.Context, volume, path string, fi FileInfo) (*CheckPartsResp, error)
+	StatInfoFile(ctx context.Context, volume, path string, glob bool) (stat []StatInfo, err error)
+	ReadParts(ctx context.Context, bucket string, partMetaPaths ...string) ([]*ObjectPartInfo, error)
+	ReadMultiple(ctx context.Context, req ReadMultipleReq, resp chan<- ReadMultipleResp) error
+	CleanAbandonedData(ctx context.Context, volume string, path string) error
 
 	// Write all data, syncs the data to disk.
 	// Should be used for smaller payloads.
@@ -81,51 +110,5 @@ type StorageAPI interface {
 
 	// Read all.
 	ReadAll(ctx context.Context, volume string, path string) (buf []byte, err error)
-
 	GetDiskLoc() (poolIdx, setIdx, diskIdx int) // Retrieve location indexes.
-	SetDiskLoc(poolIdx, setIdx, diskIdx int)    // Set location indexes.
-}
-
-// storageReader is an io.Reader view of a disk
-type storageReader struct {
-	storage      StorageAPI
-	volume, path string
-	offset       int64
-}
-
-func (r *storageReader) Read(p []byte) (n int, err error) {
-	nn, err := r.storage.ReadFile(context.TODO(), r.volume, r.path, r.offset, p, nil)
-	r.offset += nn
-	n = int(nn)
-
-	if err == io.ErrUnexpectedEOF && nn > 0 {
-		err = io.EOF
-	}
-	return
-}
-
-// storageWriter is a io.Writer view of a disk.
-type storageWriter struct {
-	storage      StorageAPI
-	volume, path string
-}
-
-func (w *storageWriter) Write(p []byte) (n int, err error) {
-	err = w.storage.AppendFile(context.TODO(), w.volume, w.path, p)
-	if err == nil {
-		n = len(p)
-	}
-	return
-}
-
-// StorageWriter returns a new io.Writer which appends data to the file
-// at the given disk, volume and path.
-func StorageWriter(storage StorageAPI, volume, path string) io.Writer {
-	return &storageWriter{storage, volume, path}
-}
-
-// StorageReader returns a new io.Reader which reads data to the file
-// at the given disk, volume, path and offset.
-func StorageReader(storage StorageAPI, volume, path string, offset int64) io.Reader {
-	return &storageReader{storage, volume, path, offset}
 }

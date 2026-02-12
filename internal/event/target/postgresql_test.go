@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -19,6 +19,7 @@ package target
 
 import (
 	"database/sql"
+	"slices"
 	"testing"
 )
 
@@ -26,13 +27,26 @@ import (
 // is registered and fails otherwise.
 func TestPostgreSQLRegistration(t *testing.T) {
 	var found bool
-	for _, drv := range sql.Drivers() {
-		if drv == "postgres" {
-			found = true
-			break
-		}
+	if slices.Contains(sql.Drivers(), "postgres") {
+		found = true
 	}
 	if !found {
 		t.Fatal("postgres driver not registered")
+	}
+}
+
+func TestPsqlTableNameValidation(t *testing.T) {
+	validTables := []string{"táblë", "table", "TableName", "\"Table name\"", "\"✅✅\"", "table$one", "\"táblë\""}
+	invalidTables := []string{"table name", "table \"name\"", "✅✅", "$table$"}
+
+	for _, name := range validTables {
+		if err := validatePsqlTableName(name); err != nil {
+			t.Errorf("Should be valid: %s - %s", name, err)
+		}
+	}
+	for _, name := range invalidTables {
+		if err := validatePsqlTableName(name); err != errInvalidPsqlTablename {
+			t.Errorf("Should be invalid: %s - %s", name, err)
+		}
 	}
 }

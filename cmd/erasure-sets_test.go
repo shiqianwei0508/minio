@@ -40,13 +40,12 @@ func BenchmarkCrcHash(b *testing.B) {
 		{1024},
 	}
 	for _, testCase := range cases {
-		testCase := testCase
 		key := randString(testCase.key)
 		b.Run("", func(b *testing.B) {
 			b.SetBytes(1024)
 			b.ReportAllocs()
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				crcHashMod(key, 16)
 			}
 		})
@@ -65,13 +64,12 @@ func BenchmarkSipHash(b *testing.B) {
 		{1024},
 	}
 	for _, testCase := range cases {
-		testCase := testCase
 		key := randString(testCase.key)
 		b.Run("", func(b *testing.B) {
 			b.SetBytes(1024)
 			b.ReportAllocs()
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				sipHashMod(key, 16, testUUID)
 			}
 		})
@@ -159,12 +157,12 @@ func TestCrcHashMod(t *testing.T) {
 // TestNewErasure - tests initialization of all input disks
 // and constructs a valid `Erasure` object
 func TestNewErasureSets(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	var nDisks = 16 // Maximum disks.
+	nDisks := 16 // Maximum disks.
 	var erasureDisks []string
-	for i := 0; i < nDisks; i++ {
+	for range nDisks {
 		// Do not attempt to create this path, the test validates
 		// so that newErasureSets initializes non existing paths
 		// and successfully returns initialized object layer.
@@ -173,24 +171,30 @@ func TestNewErasureSets(t *testing.T) {
 		defer os.RemoveAll(disk)
 	}
 
-	endpoints := mustGetNewEndpoints(erasureDisks...)
-	_, _, err := waitForFormatErasure(true, endpoints, 1, 0, 16, "", "")
+	endpoints := mustGetNewEndpoints(0, 16, erasureDisks...)
+	_, _, err := waitForFormatErasure(true, endpoints, 1, 0, 16, "")
 	if err != errInvalidArgument {
 		t.Fatalf("Expecting error, got %s", err)
 	}
 
-	_, _, err = waitForFormatErasure(true, nil, 1, 1, 16, "", "")
+	_, _, err = waitForFormatErasure(true, nil, 1, 1, 16, "")
 	if err != errInvalidArgument {
 		t.Fatalf("Expecting error, got %s", err)
 	}
 
 	// Initializes all erasure disks
-	storageDisks, format, err := waitForFormatErasure(true, endpoints, 1, 1, 16, "", "")
+	storageDisks, format, err := waitForFormatErasure(true, endpoints, 1, 1, 16, "")
 	if err != nil {
-		t.Fatalf("Unable to format disks for erasure, %s", err)
+		t.Fatalf("Unable to format drives for erasure, %s", err)
 	}
 
-	if _, err := newErasureSets(ctx, endpoints, storageDisks, format, ecDrivesNoConfig(16), 0); err != nil {
+	ep := PoolEndpoints{Endpoints: endpoints}
+
+	parity, err := ecDrivesNoConfig(16)
+	if err != nil {
+		t.Fatalf("Unexpected error during EC drive config: %v", err)
+	}
+	if _, err := newErasureSets(ctx, ep, storageDisks, format, parity, 0); err != nil {
 		t.Fatalf("Unable to initialize erasure")
 	}
 }

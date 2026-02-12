@@ -29,12 +29,13 @@ import (
 
 // Test S3 Bucket lifecycle APIs with wrong credentials
 func TestBucketLifecycleWrongCredentials(t *testing.T) {
-	ExecObjectLayerAPITest(t, testBucketLifecycleHandlersWrongCredentials, []string{"GetBucketLifecycle", "PutBucketLifecycle", "DeleteBucketLifecycle"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testBucketLifecycleHandlersWrongCredentials, endpoints: []string{"GetBucketLifecycle", "PutBucketLifecycle", "DeleteBucketLifecycle"}})
 }
 
 // Test for authentication
 func testBucketLifecycleHandlersWrongCredentials(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
-	credentials auth.Credentials, t *testing.T) {
+	credentials auth.Credentials, t *testing.T,
+) {
 	// test cases with sample input and expected output.
 	testCases := []struct {
 		method     string
@@ -144,14 +145,14 @@ func testBucketLifecycleHandlersWrongCredentials(obj ObjectLayer, instanceType, 
 
 // Test S3 Bucket lifecycle APIs
 func TestBucketLifecycle(t *testing.T) {
-	ExecObjectLayerAPITest(t, testBucketLifecycleHandlers, []string{"GetBucketLifecycle", "PutBucketLifecycle", "DeleteBucketLifecycle"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testBucketLifecycleHandlers, endpoints: []string{"GetBucketLifecycle", "PutBucketLifecycle", "DeleteBucketLifecycle"}})
 }
 
 // Simple tests of bucket lifecycle: PUT, GET, DELETE.
 // Tests are related and the order is important.
 func testBucketLifecycleHandlers(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
-	creds auth.Credentials, t *testing.T) {
-
+	creds auth.Credentials, t *testing.T,
+) {
 	// test cases with sample input and expected output.
 	testCases := []struct {
 		method     string
@@ -178,7 +179,7 @@ func testBucketLifecycleHandlers(obj ObjectLayer, instanceType, bucketName strin
 			lifecycleResponse:  []byte(``),
 			errorResponse: APIErrorResponse{
 				Resource: SlashSeparator + bucketName + SlashSeparator,
-				Code:     "InvalidRequest",
+				Code:     "InvalidArgument",
 				Message:  "Filter must have exactly one of Prefix, Tag, or And specified",
 			},
 
@@ -195,7 +196,7 @@ func testBucketLifecycleHandlers(obj ObjectLayer, instanceType, bucketName strin
 			lifecycleResponse:  []byte(``),
 			errorResponse: APIErrorResponse{
 				Resource: SlashSeparator + bucketName + SlashSeparator,
-				Code:     "InvalidRequest",
+				Code:     "InvalidArgument",
 				Message:  "Date must be provided in ISO 8601 format",
 			},
 
@@ -266,8 +267,8 @@ func testBucketLifecycle(obj ObjectLayer, instanceType, bucketName string, apiRo
 		lifecycleResponse  []byte
 		errorResponse      APIErrorResponse
 		shouldPass         bool
-	}) {
-
+	},
+) {
 	for i, testCase := range testCases {
 		// initialize httptest Recorder, this records any mutations to response writer inside the handler.
 		rec := httptest.NewRecorder()

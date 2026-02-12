@@ -19,10 +19,8 @@ package cmd
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"io"
-	"os"
 	"testing"
 )
 
@@ -53,11 +51,11 @@ func TestErasureEncodeDecode(t *testing.T) {
 		buffer := make([]byte, len(data), 2*len(data))
 		copy(buffer, data)
 
-		erasure, err := NewErasure(context.Background(), test.dataBlocks, test.parityBlocks, blockSizeV2)
+		erasure, err := NewErasure(t.Context(), test.dataBlocks, test.parityBlocks, blockSizeV2)
 		if err != nil {
 			t.Fatalf("Test %d: failed to create erasure: %v", i, err)
 		}
-		encoded, err := erasure.EncodeData(context.Background(), buffer)
+		encoded, err := erasure.EncodeData(t.Context(), buffer)
 		if err != nil {
 			t.Fatalf("Test %d: failed to encode data: %v", i, err)
 		}
@@ -70,7 +68,7 @@ func TestErasureEncodeDecode(t *testing.T) {
 		}
 
 		if test.reconstructParity {
-			err = erasure.DecodeDataAndParityBlocks(context.Background(), encoded)
+			err = erasure.DecodeDataAndParityBlocks(t.Context(), encoded)
 		} else {
 			err = erasure.DecodeDataBlocks(encoded)
 		}
@@ -99,7 +97,7 @@ func TestErasureEncodeDecode(t *testing.T) {
 			}
 
 			decodedData := new(bytes.Buffer)
-			if _, err = writeDataBlocks(context.Background(), decodedData, decoded, test.dataBlocks, 0, int64(len(data))); err != nil {
+			if _, err = writeDataBlocks(t.Context(), decodedData, decoded, test.dataBlocks, 0, int64(len(data))); err != nil {
 				t.Errorf("Test %d: failed to write data blocks: %v", i, err)
 			}
 			if !bytes.Equal(decodedData.Bytes(), data) {
@@ -118,24 +116,17 @@ type erasureTestSetup struct {
 	disks        []StorageAPI
 }
 
-// Removes the temporary disk directories.
-func (e erasureTestSetup) Remove() {
-	for _, path := range e.diskPaths {
-		os.RemoveAll(path)
-	}
-}
-
 // Returns an initialized setup for erasure tests.
-func newErasureTestSetup(dataBlocks int, parityBlocks int, blockSize int64) (*erasureTestSetup, error) {
+func newErasureTestSetup(tb testing.TB, dataBlocks int, parityBlocks int, blockSize int64) (*erasureTestSetup, error) {
 	diskPaths := make([]string, dataBlocks+parityBlocks)
 	disks := make([]StorageAPI, len(diskPaths))
 	var err error
 	for i := range diskPaths {
-		disks[i], diskPaths[i], err = newXLStorageTestSetup()
+		disks[i], diskPaths[i], err = newXLStorageTestSetup(tb)
 		if err != nil {
 			return nil, err
 		}
-		err = disks[i].MakeVol(context.Background(), "testbucket")
+		err = disks[i].MakeVol(tb.Context(), "testbucket")
 		if err != nil {
 			return nil, err
 		}

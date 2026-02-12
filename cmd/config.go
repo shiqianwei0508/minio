@@ -21,21 +21,21 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path"
 	"sort"
 	"strings"
-	"unicode/utf8"
 
 	jsoniter "github.com/json-iterator/go"
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/kms"
 )
 
 const (
 	minioConfigPrefix = "config"
-
-	kvPrefix = ".kv"
+	minioConfigBucket = minioMetaBucket + SlashSeparator + minioConfigPrefix
+	kvPrefix          = ".kv"
 
 	// Captures all the previous SetKV operations and allows rollback.
 	minioConfigHistoryPrefix = minioConfigPrefix + "/history"
@@ -45,8 +45,8 @@ const (
 )
 
 func listServerConfigHistory(ctx context.Context, objAPI ObjectLayer, withData bool, count int) (
-	[]madmin.ConfigHistoryEntry, error) {
-
+	[]madmin.ConfigHistoryEntry, error,
+) {
 	var configHistory []madmin.ConfigHistoryEntry
 
 	// List all kvs
@@ -64,16 +64,16 @@ func listServerConfigHistory(ctx context.Context, objAPI ObjectLayer, withData b
 			if withData {
 				data, err := readConfig(ctx, objAPI, obj.Name)
 				if err != nil {
-					return nil, err
+					// ignore history file if not readable.
+					continue
 				}
-				if GlobalKMS != nil {
-					data, err = config.DecryptBytes(GlobalKMS, data, kms.Context{
-						obj.Bucket: path.Join(obj.Bucket, obj.Name),
-					})
-					if err != nil {
-						return nil, err
-					}
+
+				data, err = decryptData(data, obj.Name)
+				if err != nil {
+					// ignore history file that cannot be loaded.
+					continue
 				}
+
 				cfgEntry.Data = string(data)
 			}
 			configHistory = append(configHistory, cfgEntry)
@@ -97,7 +97,8 @@ func listServerConfigHistory(ctx context.Context, objAPI ObjectLayer, withData b
 func delServerConfigHistory(ctx context.Context, objAPI ObjectLayer, uuidKV string) error {
 	historyFile := pathJoin(minioConfigHistoryPrefix, uuidKV+kvPrefix)
 	_, err := objAPI.DeleteObject(ctx, minioMetaBucket, historyFile, ObjectOptions{
-		DeletePrefix: true,
+		DeletePrefix:       true,
+		DeletePrefixObject: true, // use prefix delete on exact object (this is an optimization to avoid fan-out calls)
 	})
 	return err
 }
@@ -109,12 +110,7 @@ func readServerConfigHistory(ctx context.Context, objAPI ObjectLayer, uuidKV str
 		return nil, err
 	}
 
-	if GlobalKMS != nil {
-		data, err = config.DecryptBytes(GlobalKMS, data, kms.Context{
-			minioMetaBucket: path.Join(minioMetaBucket, historyFile),
-		})
-	}
-	return data, err
+	return decryptData(data, historyFile)
 }
 
 func saveServerConfigHistory(ctx context.Context, objAPI ObjectLayer, kv []byte) error {
@@ -133,13 +129,13 @@ func saveServerConfigHistory(ctx context.Context, objAPI ObjectLayer, kv []byte)
 	return saveConfig(ctx, objAPI, historyFile, kv)
 }
 
-func saveServerConfig(ctx context.Context, objAPI ObjectLayer, cfg interface{}) error {
+func saveServerConfig(ctx context.Context, objAPI ObjectLayer, cfg any) error {
 	data, err := json.Marshal(cfg)
 	if err != nil {
 		return err
 	}
 
-	var configFile = path.Join(minioConfigPrefix, minioConfigFile)
+	configFile := path.Join(minioConfigPrefix, minioConfigFile)
 	if GlobalKMS != nil {
 		data, err = config.EncryptBytes(GlobalKMS, data, kms.Context{
 			minioMetaBucket: path.Join(minioMetaBucket, configFile),
@@ -151,30 +147,30 @@ func saveServerConfig(ctx context.Context, objAPI ObjectLayer, cfg interface{}) 
 	return saveConfig(ctx, objAPI, configFile, data)
 }
 
-func readServerConfig(ctx context.Context, objAPI ObjectLayer) (config.Config, error) {
-	var srvCfg = config.New()
-	configFile := path.Join(minioConfigPrefix, minioConfigFile)
-	data, err := readConfig(ctx, objAPI, configFile)
-	if err != nil {
-		if errors.Is(err, errConfigNotFound) {
-			lookupConfigs(srvCfg, objAPI)
-			return srvCfg, nil
+// data is optional. If nil it will be loaded from backend.
+func readServerConfig(ctx context.Context, objAPI ObjectLayer, data []byte) (config.Config, error) {
+	srvCfg := config.New()
+	var err error
+	if len(data) == 0 {
+		configFile := path.Join(minioConfigPrefix, minioConfigFile)
+		data, err = readConfig(ctx, objAPI, configFile)
+		if err != nil {
+			if errors.Is(err, errConfigNotFound) {
+				lookupConfigs(srvCfg, objAPI)
+				return srvCfg, nil
+			}
+			return nil, err
 		}
-		return nil, err
-	}
 
-	if GlobalKMS != nil && !utf8.Valid(data) {
-		data, err = config.DecryptBytes(GlobalKMS, data, kms.Context{
-			minioMetaBucket: path.Join(minioMetaBucket, configFile),
-		})
+		data, err = decryptData(data, configFile)
 		if err != nil {
 			lookupConfigs(srvCfg, objAPI)
 			return nil, err
 		}
 	}
 
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
-	if err = json.Unmarshal(data, &srvCfg); err != nil {
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
+	if err := json.Unmarshal(data, &srvCfg); err != nil {
 		return nil, err
 	}
 
@@ -184,11 +180,6 @@ func readServerConfig(ctx context.Context, objAPI ObjectLayer) (config.Config, e
 
 // ConfigSys - config system.
 type ConfigSys struct{}
-
-// Load - load config.json.
-func (sys *ConfigSys) Load(objAPI ObjectLayer) error {
-	return sys.Init(objAPI)
-}
 
 // Init - initializes config system from config.json.
 func (sys *ConfigSys) Init(objAPI ObjectLayer) error {
@@ -205,36 +196,32 @@ func NewConfigSys() *ConfigSys {
 }
 
 // Initialize and load config from remote etcd or local config directory
-func initConfig(objAPI ObjectLayer) error {
+func initConfig(objAPI ObjectLayer) (err error) {
+	bootstrapTraceMsg("load the configuration")
+	defer func() {
+		if err != nil {
+			bootstrapTraceMsg(fmt.Sprintf("loading configuration failed: %v", err))
+		}
+	}()
+
 	if objAPI == nil {
 		return errServerNotInitialized
 	}
 
-	if isFile(getConfigFile()) {
-		if err := migrateConfig(); err != nil {
-			return err
-		}
-	}
-
-	// Migrates ${HOME}/.minio/config.json or config.json.deprecated
-	// to '<export_path>/.minio.sys/config/config.json'
-	// ignore if the file doesn't exist.
-	// If etcd is set then migrates /config/config.json
-	// to '<export_path>/.minio.sys/config/config.json'
-	if err := migrateConfigToMinioSys(objAPI); err != nil {
+	srvCfg, err := readConfigWithoutMigrate(GlobalContext, objAPI)
+	if err != nil {
 		return err
 	}
 
-	// Migrates backend '<export_path>/.minio.sys/config/config.json' to latest version.
-	if err := migrateMinioSysConfig(objAPI); err != nil {
-		return err
-	}
+	bootstrapTraceMsg("lookup the configuration")
 
-	// Migrates backend '<export_path>/.minio.sys/config/config.json' to
-	// latest config format.
-	if err := migrateMinioSysConfigToKV(objAPI); err != nil {
-		return err
-	}
+	// Override any values from ENVs.
+	lookupConfigs(srvCfg, objAPI)
 
-	return loadConfig(objAPI)
+	// hold the mutex lock before a new config is assigned.
+	globalServerConfigMu.Lock()
+	globalServerConfig = srvCfg
+	globalServerConfigMu.Unlock()
+
+	return nil
 }

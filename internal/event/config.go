@@ -30,7 +30,7 @@ import (
 
 // ValidateFilterRuleValue - checks if given value is filter rule value or not.
 func ValidateFilterRuleValue(value string) error {
-	for _, segment := range strings.Split(value, "/") {
+	for segment := range strings.SplitSeq(value, "/") {
 		if segment == "." || segment == ".." {
 			return &ErrInvalidFilterValue{value}
 		}
@@ -139,7 +139,7 @@ func (ruleList FilterRuleList) Pattern() string {
 
 // S3Key - represents elements inside <S3Key>...</S3Key>
 type S3Key struct {
-	RuleList FilterRuleList `xml:"S3Key,omitempty" json:"S3Key,omitempty"`
+	RuleList FilterRuleList `xml:"S3Key,omitempty" json:"S3Key"`
 }
 
 // MarshalXML implements a custom marshaller to support `omitempty` feature.
@@ -318,7 +318,7 @@ func ParseConfig(reader io.Reader, region string, targetList *TargetList) (*Conf
 	}
 
 	config.SetRegion(region)
-	//If xml namespace is empty, set a default value before returning.
+	// If xml namespace is empty, set a default value before returning.
 	if config.XMLNS == "" {
 		config.XMLNS = "http://s3.amazonaws.com/doc/2006-03-01/"
 	}

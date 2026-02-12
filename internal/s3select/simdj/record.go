@@ -21,9 +21,9 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/bcicen/jstream"
 	csv "github.com/minio/csvparser"
 	"github.com/minio/minio/internal/s3select/json"
+	"github.com/minio/minio/internal/s3select/jstream"
 	"github.com/minio/minio/internal/s3select/sql"
 	"github.com/minio/simdjson-go"
 )
@@ -185,7 +185,7 @@ allElems:
 }
 
 // Raw - returns the underlying representation.
-func (r *Record) Raw() (sql.SelectObjectFormat, interface{}) {
+func (r *Record) Raw() (sql.SelectObjectFormat, any) {
 	return sql.SelectFmtSIMDJSON, r.object
 }
 
@@ -211,7 +211,7 @@ func (r *Record) WriteJSON(writer io.Writer) error {
 }
 
 // Replace the underlying buffer of json data.
-func (r *Record) Replace(k interface{}) error {
+func (r *Record) Replace(k any) error {
 	v, ok := k.(simdjson.Object)
 	if !ok {
 		return fmt.Errorf("cannot replace internal data in simd json record with type %T", k)

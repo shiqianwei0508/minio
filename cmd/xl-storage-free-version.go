@@ -30,12 +30,15 @@ const freeVersion = "free-version"
 // InitFreeVersion creates a free-version to track the tiered-content of j. If j has
 // no tiered content, it returns false.
 func (j xlMetaV2Object) InitFreeVersion(fi FileInfo) (xlMetaV2Version, bool) {
+	if fi.SkipTierFreeVersion() {
+		return xlMetaV2Version{}, false
+	}
 	if status, ok := j.MetaSys[ReservedMetadataPrefixLower+TransitionStatus]; ok && bytes.Equal(status, []byte(lifecycle.TransitionComplete)) {
 		vID, err := uuid.Parse(fi.TierFreeVersionID())
 		if err != nil {
 			panic(fmt.Errorf("Invalid Tier Object delete marker versionId %s %v", fi.TierFreeVersionID(), err))
 		}
-		freeEntry := xlMetaV2Version{Type: DeleteType}
+		freeEntry := xlMetaV2Version{Type: DeleteType, WrittenByVersion: globalVersionUnix}
 		freeEntry.DeleteMarker = &xlMetaV2DeleteMarker{
 			VersionID: vID,
 			ModTime:   j.ModTime, // fi.ModTime may be empty
@@ -66,8 +69,7 @@ func (j xlMetaV2DeleteMarker) FreeVersion() bool {
 
 // FreeVersion returns true if j represents a free-version, false otherwise.
 func (j xlMetaV2Version) FreeVersion() bool {
-	switch j.Type {
-	case DeleteType:
+	if j.Type == DeleteType {
 		return j.DeleteMarker.FreeVersion()
 	}
 	return false
@@ -75,7 +77,7 @@ func (j xlMetaV2Version) FreeVersion() bool {
 
 // AddFreeVersion adds a free-version if needed for fi.VersionID version.
 // Free-version will be added if fi.VersionID has transitioned.
-func (z *xlMetaV2) AddFreeVersion(fi FileInfo) error {
+func (x *xlMetaV2) AddFreeVersion(fi FileInfo) error {
 	var uv uuid.UUID
 	var err error
 	switch fi.VersionID {
@@ -87,19 +89,22 @@ func (z *xlMetaV2) AddFreeVersion(fi FileInfo) error {
 		}
 	}
 
-	for _, version := range z.Versions {
-		switch version.Type {
-		case ObjectType:
-			if version.ObjectV2.VersionID == uv {
-				// if uv has tiered content we add a
-				// free-version to track it for asynchronous
-				// deletion via scanner.
-				if freeVersion, toFree := version.ObjectV2.InitFreeVersion(fi); toFree {
-					z.Versions = append(z.Versions, freeVersion)
-				}
-				return nil
-			}
+	for i, version := range x.versions {
+		if version.header.VersionID != uv || version.header.Type != ObjectType {
+			continue
 		}
+		// if uv has tiered content we add a
+		// free-version to track it for asynchronous
+		// deletion via scanner.
+		ver, err := x.getIdx(i)
+		if err != nil {
+			return err
+		}
+
+		if freeVersion, toFree := ver.ObjectV2.InitFreeVersion(fi); toFree {
+			return x.addVersion(freeVersion)
+		}
+		return nil
 	}
 	return nil
 }

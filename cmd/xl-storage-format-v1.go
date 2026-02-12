@@ -18,13 +18,14 @@
 package cmd
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	jsoniter "github.com/json-iterator/go"
-	"github.com/minio/minio/internal/logger"
 )
 
 // XL constants.
@@ -51,8 +52,10 @@ func isXLMetaFormatValid(version, format string) bool {
 // Verifies if the backend format metadata is sane by validating
 // the ErasureInfo, i.e. data and parity blocks.
 func isXLMetaErasureInfoValid(data, parity int) bool {
-	return ((data >= parity) && (data != 0) && (parity != 0))
+	return ((data >= parity) && (data > 0) && (parity >= 0))
 }
+
+//msgp:clearomitted
 
 //go:generate msgp -file=$GOFILE -unexported
 
@@ -81,6 +84,9 @@ type xlMetaV1Object struct {
 type StatInfo struct {
 	Size    int64     `json:"size"`    // Size of the object `xl.meta`.
 	ModTime time.Time `json:"modTime"` // ModTime of the object `xl.meta`.
+	Name    string    `json:"name"`
+	Dir     bool      `json:"dir"`
+	Mode    uint32    `json:"mode"`
 }
 
 // ErasureInfo holds erasure coding and bitrot related information.
@@ -99,6 +105,38 @@ type ErasureInfo struct {
 	Distribution []int `json:"distribution"`
 	// Checksums holds all bitrot checksums of all erasure encoded blocks
 	Checksums []ChecksumInfo `json:"checksum,omitempty"`
+}
+
+// Equal equates current erasure info with newer erasure info.
+// returns false if one of the following check fails
+// - erasure algorithm is different
+// - data blocks are different
+// - parity blocks are different
+// - block size is different
+// - distribution array size is different
+// - distribution indexes are different
+func (ei ErasureInfo) Equal(nei ErasureInfo) bool {
+	if ei.Algorithm != nei.Algorithm {
+		return false
+	}
+	if ei.DataBlocks != nei.DataBlocks {
+		return false
+	}
+	if ei.ParityBlocks != nei.ParityBlocks {
+		return false
+	}
+	if ei.BlockSize != nei.BlockSize {
+		return false
+	}
+	if len(ei.Distribution) != len(nei.Distribution) {
+		return false
+	}
+	for i, ecindex := range ei.Distribution {
+		if ecindex != nei.Distribution[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // BitrotAlgorithm specifies a algorithm used for bitrot protection.
@@ -123,10 +161,14 @@ const (
 // ObjectPartInfo Info of each part kept in the multipart metadata
 // file after CompleteMultipartUpload() is called.
 type ObjectPartInfo struct {
-	ETag       string `json:"etag,omitempty"`
-	Number     int    `json:"number"`
-	Size       int64  `json:"size"`
-	ActualSize int64  `json:"actualSize"`
+	ETag       string            `json:"etag,omitempty" msg:"e"`
+	Number     int               `json:"number" msg:"n"`
+	Size       int64             `json:"size" msg:"s"`        // Size of the part on the disk.
+	ActualSize int64             `json:"actualSize" msg:"as"` // Original size of the part without compression or encryption bytes.
+	ModTime    time.Time         `json:"modTime" msg:"mt"`    // Date and time at which the part was uploaded.
+	Index      []byte            `json:"index,omitempty" msg:"i,omitempty"`
+	Checksums  map[string]string `json:"crc,omitempty" msg:"crc,omitempty"`   // Content Checksums
+	Error      string            `json:"error,omitempty" msg:"err,omitempty"` // only set while reading part meta from drive.
 }
 
 // ChecksumInfo - carries checksums of individual scattered parts per disk.
@@ -155,7 +197,7 @@ func (c ChecksumInfo) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON - custom checksum info unmarshaller
 func (c *ChecksumInfo) UnmarshalJSON(data []byte) error {
 	var info checksumInfoJSON
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	if err := json.Unmarshal(data, &info); err != nil {
 		return err
 	}
@@ -170,7 +212,7 @@ func (c *ChecksumInfo) UnmarshalJSON(data []byte) error {
 	}
 
 	if !c.Algorithm.Available() {
-		logger.LogIf(GlobalContext, errBitrotHashAlgoInvalid)
+		internalLogIf(GlobalContext, errBitrotHashAlgoInvalid)
 		return errBitrotHashAlgoInvalid
 	}
 	return nil
@@ -187,17 +229,41 @@ func (m *xlMetaV1Object) ToFileInfo(volume, path string) (FileInfo, error) {
 	}
 
 	fi := FileInfo{
-		Volume:    volume,
-		Name:      path,
-		ModTime:   m.Stat.ModTime,
-		Size:      m.Stat.Size,
-		Metadata:  m.Meta,
-		Parts:     m.Parts,
-		Erasure:   m.Erasure,
-		VersionID: m.VersionID,
-		DataDir:   m.DataDir,
+		Volume:      volume,
+		Name:        path,
+		ModTime:     m.Stat.ModTime,
+		Size:        m.Stat.Size,
+		Metadata:    m.Meta,
+		Parts:       m.Parts,
+		Erasure:     m.Erasure,
+		VersionID:   m.VersionID,
+		DataDir:     m.DataDir,
+		XLV1:        true,
+		NumVersions: 1,
 	}
+
 	return fi, nil
+}
+
+// Signature will return a signature that is expected to be the same across all disks.
+func (m *xlMetaV1Object) Signature() [4]byte {
+	// Shallow copy
+	c := *m
+	// Zero unimportant fields
+	c.Erasure.Index = 0
+	c.Minio.Release = ""
+	crc := hashDeterministicString(c.Meta)
+	c.Meta = nil
+
+	if bts, err := c.MarshalMsg(metaDataPoolGet()); err == nil {
+		crc ^= xxhash.Sum64(bts)
+		metaDataPoolPut(bts)
+	}
+
+	// Combine upper and lower part
+	var tmp [4]byte
+	binary.LittleEndian.PutUint32(tmp[:], uint32(crc^(crc>>32)))
+	return tmp
 }
 
 // XL metadata constants.

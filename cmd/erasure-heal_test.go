@@ -19,14 +19,10 @@ package cmd
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"io"
 	"os"
 	"testing"
-
-	humanize "github.com/dustin/go-humanize"
-	"github.com/minio/minio/internal/bpool"
 )
 
 var erasureHealTests = []struct {
@@ -69,34 +65,31 @@ func TestErasureHeal(t *testing.T) {
 	for i, test := range erasureHealTests {
 		if test.offDisks < test.badStaleDisks {
 			// test case sanity check
-			t.Fatalf("Test %d: Bad test case - number of stale disks cannot be less than number of badstale disks", i)
+			t.Fatalf("Test %d: Bad test case - number of stale drives cannot be less than number of badstale drives", i)
 		}
 
 		// create some test data
-		setup, err := newErasureTestSetup(test.dataBlocks, test.disks-test.dataBlocks, test.blocksize)
+		setup, err := newErasureTestSetup(t, test.dataBlocks, test.disks-test.dataBlocks, test.blocksize)
 		if err != nil {
 			t.Fatalf("Test %d: failed to setup Erasure environment: %v", i, err)
 		}
 		disks := setup.disks
-		erasure, err := NewErasure(context.Background(), test.dataBlocks, test.disks-test.dataBlocks, test.blocksize)
+		erasure, err := NewErasure(t.Context(), test.dataBlocks, test.disks-test.dataBlocks, test.blocksize)
 		if err != nil {
-			setup.Remove()
 			t.Fatalf("Test %d: failed to create ErasureStorage: %v", i, err)
 		}
 		data := make([]byte, test.size)
 		if _, err = io.ReadFull(rand.Reader, data); err != nil {
-			setup.Remove()
 			t.Fatalf("Test %d: failed to create random test data: %v", i, err)
 		}
 		buffer := make([]byte, test.blocksize, 2*test.blocksize)
 		writers := make([]io.Writer, len(disks))
 		for i, disk := range disks {
-			writers[i] = newBitrotWriter(disk, "testbucket", "testobject", erasure.ShardFileSize(test.size), test.algorithm, erasure.ShardSize())
+			writers[i] = newBitrotWriter(disk, "", "testbucket", "testobject", erasure.ShardFileSize(test.size), test.algorithm, erasure.ShardSize())
 		}
-		_, err = erasure.Encode(context.Background(), bytes.NewReader(data), writers, buffer, erasure.dataBlocks+1)
+		_, err = erasure.Encode(t.Context(), bytes.NewReader(data), writers, buffer, erasure.dataBlocks+1)
 		closeBitrotWriters(writers)
 		if err != nil {
-			setup.Remove()
 			t.Fatalf("Test %d: failed to create random test data: %v", i, err)
 		}
 
@@ -109,7 +102,7 @@ func TestErasureHeal(t *testing.T) {
 		// setup stale disks for the test case
 		staleDisks := make([]StorageAPI, len(disks))
 		copy(staleDisks, disks)
-		for j := 0; j < len(staleDisks); j++ {
+		for j := range staleDisks {
 			if j < test.offDisks {
 				readers[j] = nil
 			} else {
@@ -134,18 +127,11 @@ func TestErasureHeal(t *testing.T) {
 				continue
 			}
 			os.Remove(pathJoin(disk.String(), "testbucket", "testobject"))
-			staleWriters[i] = newBitrotWriter(disk, "testbucket", "testobject", erasure.ShardFileSize(test.size), test.algorithm, erasure.ShardSize())
+			staleWriters[i] = newBitrotWriter(disk, "", "testbucket", "testobject", erasure.ShardFileSize(test.size), test.algorithm, erasure.ShardSize())
 		}
 
-		// Number of buffers, max 2GB
-		n := (2 * humanize.GiByte) / (int(test.blocksize) * 2)
-
-		// Initialize byte pool once for all sets, bpool size is set to
-		// setCount * setDriveCount with each memory upto blockSizeV2.
-		bp := bpool.NewBytePoolCap(n, int(test.blocksize), int(test.blocksize)*2)
-
 		// test case setup is complete - now call Heal()
-		err = erasure.Heal(context.Background(), readers, staleWriters, test.size, bp)
+		err = erasure.Heal(t.Context(), staleWriters, readers, test.size, nil)
 		closeBitrotReaders(readers)
 		closeBitrotWriters(staleWriters)
 		if err != nil && !test.shouldFail {
@@ -166,6 +152,5 @@ func TestErasureHeal(t *testing.T) {
 				}
 			}
 		}
-		setup.Remove()
 	}
 }

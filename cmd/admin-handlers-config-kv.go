@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -19,32 +19,32 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 
-	"github.com/gorilla/mux"
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/config"
-	"github.com/minio/minio/internal/config/cache"
 	"github.com/minio/minio/internal/config/etcd"
 	xldap "github.com/minio/minio/internal/config/identity/ldap"
 	"github.com/minio/minio/internal/config/identity/openid"
-	"github.com/minio/minio/internal/config/policy/opa"
+	idplugin "github.com/minio/minio/internal/config/identity/plugin"
+	polplugin "github.com/minio/minio/internal/config/policy/plugin"
 	"github.com/minio/minio/internal/config/storageclass"
+	"github.com/minio/minio/internal/config/subnet"
 	"github.com/minio/minio/internal/logger"
-	iampolicy "github.com/minio/pkg/iam/policy"
+	"github.com/minio/mux"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // DelConfigKVHandler - DELETE /minio/admin/v3/del-config-kv
 func (a adminAPIHandlers) DelConfigKVHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "DeleteConfigKV")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, cred := validateAdminReq(ctx, w, r, iampolicy.ConfigUpdateAdminAction)
+	objectAPI, cred := validateAdminReq(ctx, w, r, policy.ConfigUpdateAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -58,12 +58,18 @@ func (a adminAPIHandlers) DelConfigKVHandler(w http.ResponseWriter, r *http.Requ
 	password := cred.SecretKey
 	kvBytes, err := madmin.DecryptData(password, io.LimitReader(r.Body, r.ContentLength))
 	if err != nil {
-		logger.LogIf(ctx, err, logger.Application)
+		adminLogIf(ctx, err)
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigBadJSON), r.URL)
 		return
 	}
 
-	cfg, err := readServerConfig(ctx, objectAPI)
+	subSys, _, _, err := config.GetSubSys(string(kvBytes))
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+
+	cfg, err := readServerConfig(ctx, objectAPI, nil)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
@@ -74,19 +80,75 @@ func (a adminAPIHandlers) DelConfigKVHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	if err = validateConfig(ctx, cfg, subSys); err != nil {
+		writeCustomErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigBadJSON), err.Error(), r.URL)
+		return
+	}
+
+	// Check if subnet proxy being deleted and if so the value of proxy of subnet
+	// target of logger webhook configuration also should be deleted
+	loggerWebhookProxyDeleted := setLoggerWebhookSubnetProxy(subSys, cfg)
+
 	if err = saveServerConfig(ctx, objectAPI, cfg); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
+
+	// freshly retrieve the config so that default values are loaded for reset config
+	if cfg, err = getValidConfig(objectAPI); err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+
+	dynamic := config.SubSystemsDynamic.Contains(subSys)
+	if dynamic {
+		applyDynamic(ctx, objectAPI, cfg, subSys, r, w)
+		if subSys == config.SubnetSubSys && loggerWebhookProxyDeleted {
+			// Logger webhook proxy deleted, apply the dynamic changes
+			applyDynamic(ctx, objectAPI, cfg, config.LoggerWebhookSubSys, r, w)
+		}
+	}
+}
+
+func applyDynamic(ctx context.Context, objectAPI ObjectLayer, cfg config.Config, subSys string,
+	r *http.Request, w http.ResponseWriter,
+) {
+	// Apply dynamic values.
+	if err := applyDynamicConfigForSubSys(GlobalContext, objectAPI, cfg, subSys); err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+	globalNotificationSys.SignalConfigReload(subSys)
+	// Tell the client that dynamic config was applied.
+	w.Header().Set(madmin.ConfigAppliedHeader, madmin.ConfigAppliedTrue)
+}
+
+type badConfigErr struct {
+	Err error
+}
+
+// Error - return the error message
+func (bce badConfigErr) Error() string {
+	return bce.Err.Error()
+}
+
+// Unwrap the error to its underlying error.
+func (bce badConfigErr) Unwrap() error {
+	return bce.Err
+}
+
+type setConfigResult struct {
+	Cfg                     config.Config
+	SubSys                  string
+	Dynamic                 bool
+	LoggerWebhookCfgUpdated bool
 }
 
 // SetConfigKVHandler - PUT /minio/admin/v3/set-config-kv
 func (a adminAPIHandlers) SetConfigKVHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "SetConfigKV")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, cred := validateAdminReq(ctx, w, r, iampolicy.ConfigUpdateAdminAction)
+	objectAPI, cred := validateAdminReq(ctx, w, r, policy.ConfigUpdateAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -100,75 +162,120 @@ func (a adminAPIHandlers) SetConfigKVHandler(w http.ResponseWriter, r *http.Requ
 	password := cred.SecretKey
 	kvBytes, err := madmin.DecryptData(password, io.LimitReader(r.Body, r.ContentLength))
 	if err != nil {
-		logger.LogIf(ctx, err, logger.Application)
+		adminLogIf(ctx, err)
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigBadJSON), r.URL)
 		return
 	}
 
-	cfg, err := readServerConfig(ctx, objectAPI)
+	result, err := setConfigKV(ctx, objectAPI, kvBytes)
 	if err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-
-	dynamic, err := cfg.ReadConfig(bytes.NewReader(kvBytes))
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-
-	if err = validateConfig(cfg); err != nil {
-		writeCustomErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigBadJSON), err.Error(), r.URL)
-		return
-	}
-
-	// Update the actual server config on disk.
-	if err = saveServerConfig(ctx, objectAPI, cfg); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-
-	// Write to the config input KV to history.
-	if err = saveServerConfigHistory(ctx, objectAPI, kvBytes); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-
-	if dynamic {
-		// Apply dynamic values.
-		if err := applyDynamicConfig(GlobalContext, objectAPI, cfg); err != nil {
+		switch err.(type) {
+		case badConfigErr:
+			writeCustomErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigBadJSON), err.Error(), r.URL)
+		default:
 			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-			return
 		}
-		globalNotificationSys.SignalService(serviceReloadDynamic)
-		// If all values were dynamic, tell the client.
-		w.Header().Set(madmin.ConfigAppliedHeader, madmin.ConfigAppliedTrue)
+		return
 	}
+
+	if result.Dynamic {
+		applyDynamic(ctx, objectAPI, result.Cfg, result.SubSys, r, w)
+		// If logger webhook config updated (proxy due to callhome), explicitly dynamically
+		// apply the config
+		if result.LoggerWebhookCfgUpdated {
+			applyDynamic(ctx, objectAPI, result.Cfg, config.LoggerWebhookSubSys, r, w)
+		}
+	}
+
 	writeSuccessResponseHeadersOnly(w)
 }
 
+func setConfigKV(ctx context.Context, objectAPI ObjectLayer, kvBytes []byte) (result setConfigResult, err error) {
+	result.Cfg, err = readServerConfig(ctx, objectAPI, nil)
+	if err != nil {
+		return result, err
+	}
+
+	result.Dynamic, err = result.Cfg.ReadConfig(bytes.NewReader(kvBytes))
+	if err != nil {
+		return result, err
+	}
+
+	result.SubSys, _, _, err = config.GetSubSys(string(kvBytes))
+	if err != nil {
+		return result, err
+	}
+
+	tgts, err := config.ParseConfigTargetID(bytes.NewReader(kvBytes))
+	if err != nil {
+		return result, err
+	}
+	ctx = context.WithValue(ctx, config.ContextKeyForTargetFromConfig, tgts)
+	if verr := validateConfig(ctx, result.Cfg, result.SubSys); verr != nil {
+		err = badConfigErr{Err: verr}
+		return result, err
+	}
+
+	// Check if subnet proxy being set and if so set the same value to proxy of subnet
+	// target of logger webhook configuration
+	result.LoggerWebhookCfgUpdated = setLoggerWebhookSubnetProxy(result.SubSys, result.Cfg)
+
+	// Update the actual server config on disk.
+	if err = saveServerConfig(ctx, objectAPI, result.Cfg); err != nil {
+		return result, err
+	}
+
+	// Write the config input KV to history.
+	err = saveServerConfigHistory(ctx, objectAPI, kvBytes)
+	return result, err
+}
+
 // GetConfigKVHandler - GET /minio/admin/v3/get-config-kv?key={key}
+//
+// `key` can be one of three forms:
+// 1. `subsys:target` -> request for config of a single subsystem and target pair.
+// 2. `subsys:` -> request for config of a single subsystem and the default target.
+// 3. `subsys` -> request for config of all targets for the given subsystem.
+//
+// This is a reporting API and config secrets are redacted in the response.
 func (a adminAPIHandlers) GetConfigKVHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "GetConfigKV")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, cred := validateAdminReq(ctx, w, r, iampolicy.ConfigUpdateAdminAction)
+	objectAPI, cred := validateAdminReq(ctx, w, r, policy.ConfigUpdateAdminAction)
 	if objectAPI == nil {
 		return
 	}
 
 	cfg := globalServerConfig.Clone()
 	vars := mux.Vars(r)
-	var buf = &bytes.Buffer{}
-	cw := config.NewConfigWriteTo(cfg, vars["key"])
-	if _, err := cw.WriteTo(buf); err != nil {
+	key := vars["key"]
+
+	var subSys, target string
+	{
+		ws := strings.SplitN(key, madmin.SubSystemSeparator, 2)
+		subSys = ws[0]
+		if len(ws) == 2 {
+			if ws[1] == "" {
+				target = madmin.Default
+			} else {
+				target = ws[1]
+			}
+		}
+	}
+
+	subSysConfigs, err := cfg.GetSubsysInfo(subSys, target, true)
+	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
+	var s strings.Builder
+	for _, subSysConfig := range subSysConfigs {
+		subSysConfig.WriteTo(&s, false)
+	}
+
 	password := cred.SecretKey
-	econfigData, err := madmin.EncryptData(password, buf.Bytes())
+	econfigData, err := madmin.EncryptData(password, []byte(s.String()))
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
@@ -178,11 +285,9 @@ func (a adminAPIHandlers) GetConfigKVHandler(w http.ResponseWriter, r *http.Requ
 }
 
 func (a adminAPIHandlers) ClearConfigHistoryKVHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "ClearConfigHistoryKV")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ConfigUpdateAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.ConfigUpdateAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -205,21 +310,17 @@ func (a adminAPIHandlers) ClearConfigHistoryKVHandler(w http.ResponseWriter, r *
 				return
 			}
 		}
-	} else {
-		if err := delServerConfigHistory(ctx, objectAPI, restoreID); err != nil {
-			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-			return
-		}
+	} else if err := delServerConfigHistory(ctx, objectAPI, restoreID); err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
 	}
 }
 
 // RestoreConfigHistoryKVHandler - restores a config with KV settings for the given KV id.
 func (a adminAPIHandlers) RestoreConfigHistoryKVHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "RestoreConfigHistoryKV")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ConfigUpdateAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.ConfigUpdateAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -237,7 +338,7 @@ func (a adminAPIHandlers) RestoreConfigHistoryKVHandler(w http.ResponseWriter, r
 		return
 	}
 
-	cfg, err := readServerConfig(ctx, objectAPI)
+	cfg, err := readServerConfig(ctx, objectAPI, nil)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
@@ -248,7 +349,7 @@ func (a adminAPIHandlers) RestoreConfigHistoryKVHandler(w http.ResponseWriter, r
 		return
 	}
 
-	if err = validateConfig(cfg); err != nil {
+	if err = validateConfig(ctx, cfg, ""); err != nil {
 		writeCustomErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigBadJSON), err.Error(), r.URL)
 		return
 	}
@@ -263,11 +364,9 @@ func (a adminAPIHandlers) RestoreConfigHistoryKVHandler(w http.ResponseWriter, r
 
 // ListConfigHistoryKVHandler - lists all the KV ids.
 func (a adminAPIHandlers) ListConfigHistoryKVHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "ListConfigHistoryKV")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, cred := validateAdminReq(ctx, w, r, iampolicy.ConfigUpdateAdminAction)
+	objectAPI, cred := validateAdminReq(ctx, w, r, policy.ConfigUpdateAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -303,11 +402,9 @@ func (a adminAPIHandlers) ListConfigHistoryKVHandler(w http.ResponseWriter, r *h
 
 // HelpConfigKVHandler - GET /minio/admin/v3/help-config-kv?subSys={subSys}&key={key}
 func (a adminAPIHandlers) HelpConfigKVHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "HelpConfigKV")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ConfigUpdateAdminAction)
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.ConfigUpdateAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -326,16 +423,13 @@ func (a adminAPIHandlers) HelpConfigKVHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	json.NewEncoder(w).Encode(rd)
-	w.(http.Flusher).Flush()
 }
 
 // SetConfigHandler - PUT /minio/admin/v3/config
 func (a adminAPIHandlers) SetConfigHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "SetConfig")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, cred := validateAdminReq(ctx, w, r, iampolicy.ConfigUpdateAdminAction)
+	objectAPI, cred := validateAdminReq(ctx, w, r, policy.ConfigUpdateAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -349,7 +443,7 @@ func (a adminAPIHandlers) SetConfigHandler(w http.ResponseWriter, r *http.Reques
 	password := cred.SecretKey
 	kvBytes, err := madmin.DecryptData(password, io.LimitReader(r.Body, r.ContentLength))
 	if err != nil {
-		logger.LogIf(ctx, err, logger.Application)
+		adminLogIf(ctx, err)
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigBadJSON), r.URL)
 		return
 	}
@@ -360,7 +454,7 @@ func (a adminAPIHandlers) SetConfigHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if err = validateConfig(cfg); err != nil {
+	if err = validateConfig(ctx, cfg, ""); err != nil {
 		writeCustomErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigBadJSON), err.Error(), r.URL)
 		return
 	}
@@ -381,13 +475,13 @@ func (a adminAPIHandlers) SetConfigHandler(w http.ResponseWriter, r *http.Reques
 }
 
 // GetConfigHandler - GET /minio/admin/v3/config
-// Get config.json of this minio setup.
+//
+// This endpoint is mainly for exporting and backing up the configuration.
+// Secrets are not redacted.
 func (a adminAPIHandlers) GetConfigHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "GetConfig")
+	ctx := r.Context()
 
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, cred := validateAdminReq(ctx, w, r, iampolicy.ConfigUpdateAdminAction)
+	objectAPI, cred := validateAdminReq(ctx, w, r, policy.ConfigUpdateAdminAction)
 	if objectAPI == nil {
 		return
 	}
@@ -396,45 +490,29 @@ func (a adminAPIHandlers) GetConfigHandler(w http.ResponseWriter, r *http.Reques
 
 	var s strings.Builder
 	hkvs := config.HelpSubSysMap[""]
-	var count int
 	for _, hkv := range hkvs {
-		count += len(cfg[hkv.Key])
-	}
-	for _, hkv := range hkvs {
-		v := cfg[hkv.Key]
-		for target, kv := range v {
-			off := kv.Get(config.Enable) == config.EnableOff
+		// We ignore the error below, as we cannot get one.
+		cfgSubsysItems, _ := cfg.GetSubsysInfo(hkv.Key, "", false)
+
+		for _, item := range cfgSubsysItems {
+			off := item.Config.Get(config.Enable) == config.EnableOff
 			switch hkv.Key {
 			case config.EtcdSubSys:
-				off = !etcd.Enabled(kv)
-			case config.CacheSubSys:
-				off = !cache.Enabled(kv)
+				off = !etcd.Enabled(item.Config)
 			case config.StorageClassSubSys:
-				off = !storageclass.Enabled(kv)
-			case config.PolicyOPASubSys:
-				off = !opa.Enabled(kv)
+				off = !storageclass.Enabled(item.Config)
+			case config.PolicyPluginSubSys:
+				off = !polplugin.Enabled(item.Config)
 			case config.IdentityOpenIDSubSys:
-				off = !openid.Enabled(kv)
+				off = !openid.Enabled(item.Config)
 			case config.IdentityLDAPSubSys:
-				off = !xldap.Enabled(kv)
+				off = !xldap.Enabled(item.Config)
 			case config.IdentityTLSSubSys:
-				off = !globalSTSTLSConfig.Enabled
+				off = !globalIAMSys.STSTLSConfig.Enabled
+			case config.IdentityPluginSubSys:
+				off = !idplugin.Enabled(item.Config)
 			}
-			if off {
-				s.WriteString(config.KvComment)
-				s.WriteString(config.KvSpaceSeparator)
-			}
-			s.WriteString(hkv.Key)
-			if target != config.Default {
-				s.WriteString(config.SubSystemSeparator)
-				s.WriteString(target)
-			}
-			s.WriteString(config.KvSpaceSeparator)
-			s.WriteString(kv.String())
-			count--
-			if count > 0 {
-				s.WriteString(config.KvNewline)
-			}
+			item.WriteTo(&s, off)
 		}
 	}
 
@@ -446,4 +524,19 @@ func (a adminAPIHandlers) GetConfigHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	writeSuccessResponseJSON(w, econfigData)
+}
+
+// setLoggerWebhookSubnetProxy - Sets the logger webhook's subnet proxy value to
+// one being set for subnet proxy
+func setLoggerWebhookSubnetProxy(subSys string, cfg config.Config) bool {
+	if subSys == config.SubnetSubSys || subSys == config.LoggerWebhookSubSys {
+		subnetWebhookCfg := cfg[config.LoggerWebhookSubSys][subnet.LoggerWebhookName]
+		loggerWebhookSubnetProxy := subnetWebhookCfg.Get(logger.Proxy)
+		subnetProxy := cfg[config.SubnetSubSys][config.Default].Get(logger.Proxy)
+		if loggerWebhookSubnetProxy != subnetProxy {
+			subnetWebhookCfg.Set(logger.Proxy, subnetProxy)
+			return true
+		}
+	}
+	return false
 }

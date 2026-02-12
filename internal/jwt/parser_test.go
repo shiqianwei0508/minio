@@ -27,7 +27,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt"
+	"github.com/golang-jwt/jwt/v4"
 )
 
 var (
@@ -176,7 +176,6 @@ func standardClaimsToken(claims *StandardClaims) string {
 func TestParserParse(t *testing.T) {
 	// Iterate over test data set and run tests
 	for _, data := range jwtTestData {
-		data := data
 		t.Run(data.name, func(t *testing.T) {
 			// Parse the token
 			var err error

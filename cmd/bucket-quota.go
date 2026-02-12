@@ -20,35 +20,68 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
-	"github.com/minio/madmin-go"
-	"github.com/minio/minio/internal/event"
+	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio/internal/cachevalue"
 	"github.com/minio/minio/internal/logger"
 )
 
 // BucketQuotaSys - map of bucket and quota configuration.
-type BucketQuotaSys struct {
-	bucketStorageCache timedValue
-}
+type BucketQuotaSys struct{}
 
 // Get - Get quota configuration.
-func (sys *BucketQuotaSys) Get(bucketName string) (*madmin.BucketQuota, error) {
-	if globalIsGateway {
-		objAPI := newObjectLayerFn()
-		if objAPI == nil {
-			return nil, errServerNotInitialized
-		}
-		return &madmin.BucketQuota{}, nil
-	}
-
-	return globalBucketMetadataSys.GetQuotaConfig(bucketName)
+func (sys *BucketQuotaSys) Get(ctx context.Context, bucketName string) (*madmin.BucketQuota, error) {
+	cfg, _, err := globalBucketMetadataSys.GetQuotaConfig(ctx, bucketName)
+	return cfg, err
 }
 
 // NewBucketQuotaSys returns initialized BucketQuotaSys
 func NewBucketQuotaSys() *BucketQuotaSys {
 	return &BucketQuotaSys{}
+}
+
+var bucketStorageCache = cachevalue.New[DataUsageInfo]()
+
+// Init initialize bucket quota.
+func (sys *BucketQuotaSys) Init(objAPI ObjectLayer) {
+	bucketStorageCache.InitOnce(10*time.Second,
+		cachevalue.Opts{ReturnLastGood: true, NoWait: true},
+		func(ctx context.Context) (DataUsageInfo, error) {
+			if objAPI == nil {
+				return DataUsageInfo{}, errServerNotInitialized
+			}
+			ctx, done := context.WithTimeout(ctx, 2*time.Second)
+			defer done()
+
+			return loadDataUsageFromBackend(ctx, objAPI)
+		},
+	)
+}
+
+// GetBucketUsageInfo return bucket usage info for a given bucket
+func (sys *BucketQuotaSys) GetBucketUsageInfo(ctx context.Context, bucket string) BucketUsageInfo {
+	sys.Init(newObjectLayerFn())
+
+	dui, err := bucketStorageCache.GetWithCtx(ctx)
+	timedout := OperationTimedOut{}
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.As(err, &timedout) {
+		if len(dui.BucketsUsage) > 0 {
+			internalLogOnceIf(GlobalContext, fmt.Errorf("unable to retrieve usage information for bucket: %s, relying on older value cached in-memory: err(%v)", bucket, err), "bucket-usage-cache-"+bucket)
+		} else {
+			internalLogOnceIf(GlobalContext, errors.New("unable to retrieve usage information for bucket: %s, no reliable usage value available - quota will not be enforced"), "bucket-usage-empty-"+bucket)
+		}
+	}
+
+	if len(dui.BucketsUsage) > 0 {
+		bui, ok := dui.BucketsUsage[bucket]
+		if ok {
+			return bui
+		}
+	}
+	return BucketUsageInfo{}
 }
 
 // parseBucketQuota parses BucketQuota from json
@@ -58,47 +91,40 @@ func parseBucketQuota(bucket string, data []byte) (quotaCfg *madmin.BucketQuota,
 		return quotaCfg, err
 	}
 	if !quotaCfg.IsValid() {
+		if quotaCfg.Type == "fifo" {
+			internalLogIf(GlobalContext, errors.New("Detected older 'fifo' quota config, 'fifo' feature is removed and not supported anymore. Please clear your quota configs using 'mc quota clear alias/bucket' and use 'mc ilm add' for expiration of objects"), logger.WarningKind)
+			return quotaCfg, fmt.Errorf("invalid quota type 'fifo'")
+		}
 		return quotaCfg, fmt.Errorf("Invalid quota config %#v", quotaCfg)
 	}
-	return
+	return quotaCfg, err
 }
 
-func (sys *BucketQuotaSys) check(ctx context.Context, bucket string, size int64) error {
-	objAPI := newObjectLayerFn()
-	if objAPI == nil {
-		return errServerNotInitialized
+func (sys *BucketQuotaSys) enforceQuotaHard(ctx context.Context, bucket string, size int64) error {
+	if size < 0 {
+		return nil
 	}
 
-	sys.bucketStorageCache.Once.Do(func() {
-		sys.bucketStorageCache.TTL = 1 * time.Second
-		sys.bucketStorageCache.Update = func() (interface{}, error) {
-			ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
-			defer done()
-			return loadDataUsageFromBackend(ctx, objAPI)
-		}
-	})
-
-	q, err := sys.Get(bucket)
+	q, err := sys.Get(ctx, bucket)
 	if err != nil {
 		return err
 	}
 
-	if q != nil && q.Type == madmin.HardQuota && q.Quota > 0 {
-		v, err := sys.bucketStorageCache.Get()
-		if err != nil {
-			return err
+	var quotaSize uint64
+	if q != nil && q.Type == madmin.HardQuota {
+		if q.Size > 0 {
+			quotaSize = q.Size
+		} else if q.Quota > 0 {
+			quotaSize = q.Quota
+		}
+	}
+	if quotaSize > 0 {
+		if uint64(size) >= quotaSize { // check if file size already exceeds the quota
+			return BucketQuotaExceeded{Bucket: bucket}
 		}
 
-		dui := v.(madmin.DataUsageInfo)
-
-		bui, ok := dui.BucketsUsage[bucket]
-		if !ok {
-			// bucket not found, cannot enforce quota
-			// call will fail anyways later.
-			return nil
-		}
-
-		if (bui.Size + uint64(size)) >= q.Quota {
+		bui := sys.GetBucketUsageInfo(ctx, bucket)
+		if bui.Size > 0 && ((bui.Size + uint64(size)) >= quotaSize) {
 			return BucketQuotaExceeded{Bucket: bucket}
 		}
 	}
@@ -106,120 +132,9 @@ func (sys *BucketQuotaSys) check(ctx context.Context, bucket string, size int64)
 	return nil
 }
 
-func enforceBucketQuota(ctx context.Context, bucket string, size int64) error {
-	if size < 0 {
+func enforceBucketQuotaHard(ctx context.Context, bucket string, size int64) error {
+	if globalBucketQuotaSys == nil {
 		return nil
 	}
-
-	return globalBucketQuotaSys.check(ctx, bucket, size)
-}
-
-// enforceFIFOQuota deletes objects in FIFO order until sufficient objects
-// have been deleted so as to bring bucket usage within quota.
-func enforceFIFOQuotaBucket(ctx context.Context, objectAPI ObjectLayer, bucket string, bui BucketUsageInfo) {
-	// Check if the current bucket has quota restrictions, if not skip it
-	cfg, err := globalBucketQuotaSys.Get(bucket)
-	if err != nil {
-		return
-	}
-
-	if cfg.Type != madmin.FIFOQuota {
-		return
-	}
-
-	var toFree uint64
-	if bui.Size > cfg.Quota && cfg.Quota > 0 {
-		toFree = bui.Size - cfg.Quota
-	}
-
-	if toFree <= 0 {
-		return
-	}
-
-	// Allocate new results channel to receive ObjectInfo.
-	objInfoCh := make(chan ObjectInfo)
-
-	versioned := globalBucketVersioningSys.Enabled(bucket)
-
-	// Walk through all objects
-	if err := objectAPI.Walk(ctx, bucket, "", objInfoCh, ObjectOptions{WalkVersions: versioned}); err != nil {
-		logger.LogIf(ctx, err)
-		return
-	}
-
-	// reuse the fileScorer used by disk cache to score entries by
-	// ModTime to find the oldest objects in bucket to delete. In
-	// the context of bucket quota enforcement - number of hits are
-	// irrelevant.
-	scorer, err := newFileScorer(toFree, time.Now().Unix(), 1)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return
-	}
-
-	rcfg, _ := globalBucketObjectLockSys.Get(bucket)
-	for obj := range objInfoCh {
-		if obj.DeleteMarker {
-			// Delete markers are automatically added for FIFO purge.
-			scorer.addFileWithObjInfo(obj, 1)
-			continue
-		}
-		// skip objects currently under retention
-		if rcfg.LockEnabled && enforceRetentionForDeletion(ctx, obj) {
-			continue
-		}
-		scorer.addFileWithObjInfo(obj, 1)
-	}
-
-	// If we saw less than quota we are good.
-	if scorer.seenBytes <= cfg.Quota {
-		return
-	}
-	// Calculate how much we want to delete now.
-	toFreeNow := scorer.seenBytes - cfg.Quota
-	// We were less over quota than we thought. Adjust so we delete less.
-	// If we are more over, leave it for the next run to pick up.
-	if toFreeNow < toFree {
-		if !scorer.adjustSaveBytes(int64(toFreeNow) - int64(toFree)) {
-			// We got below or at quota.
-			return
-		}
-	}
-
-	var objects []ObjectToDelete
-	numKeys := len(scorer.fileObjInfos())
-	for i, obj := range scorer.fileObjInfos() {
-		objects = append(objects, ObjectToDelete{
-			ObjectName: obj.Name,
-			VersionID:  obj.VersionID,
-		})
-		if len(objects) < maxDeleteList && (i < numKeys-1) {
-			// skip deletion until maxDeleteList or end of slice
-			continue
-		}
-
-		if len(objects) == 0 {
-			break
-		}
-
-		// Deletes a list of objects.
-		_, deleteErrs := objectAPI.DeleteObjects(ctx, bucket, objects, ObjectOptions{
-			Versioned: versioned,
-		})
-		for i := range deleteErrs {
-			if deleteErrs[i] != nil {
-				logger.LogIf(ctx, deleteErrs[i])
-				continue
-			}
-
-			// Notify object deleted event.
-			sendEvent(eventArgs{
-				EventName:  event.ObjectRemovedDelete,
-				BucketName: bucket,
-				Object:     obj,
-				Host:       "Internal: [FIFO-QUOTA-EXPIRY]",
-			})
-		}
-		objects = nil
-	}
+	return globalBucketQuotaSys.enforceQuotaHard(ctx, bucket, size)
 }

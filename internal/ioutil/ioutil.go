@@ -20,14 +20,57 @@
 package ioutil
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
+	"runtime/debug"
 	"time"
 
+	"github.com/dustin/go-humanize"
+	"github.com/minio/minio/internal/bpool"
 	"github.com/minio/minio/internal/disk"
 )
+
+// Block sizes constant.
+const (
+	SmallBlock  = 32 * humanize.KiByte  // Default r/w block size for smaller objects.
+	MediumBlock = 128 * humanize.KiByte // Default r/w block size for medium sized objects.
+	LargeBlock  = 1 * humanize.MiByte   // Default r/w block size for normal objects.
+)
+
+// AlignedBytePool is a pool of fixed size aligned blocks
+type AlignedBytePool struct {
+	size int
+	p    bpool.Pool[*[]byte]
+}
+
+// NewAlignedBytePool creates a new pool with the specified size.
+func NewAlignedBytePool(sz int) *AlignedBytePool {
+	return &AlignedBytePool{size: sz, p: bpool.Pool[*[]byte]{New: func() *[]byte {
+		b := disk.AlignedBlock(sz)
+		return &b
+	}}}
+}
+
+// aligned sync.Pool's
+var (
+	ODirectPoolLarge  = NewAlignedBytePool(LargeBlock)
+	ODirectPoolMedium = NewAlignedBytePool(MediumBlock)
+	ODirectPoolSmall  = NewAlignedBytePool(SmallBlock)
+)
+
+// Get a block.
+func (p *AlignedBytePool) Get() *[]byte {
+	return p.p.Get()
+}
+
+// Put a block.
+func (p *AlignedBytePool) Put(pb *[]byte) {
+	if pb != nil && len(*pb) == p.size {
+		p.p.Put(pb)
+	}
+}
 
 // WriteOnCloser implements io.WriteCloser and always
 // executes at least one write operation if it is closed.
@@ -67,12 +110,59 @@ func WriteOnClose(w io.Writer) *WriteOnCloser {
 	return &WriteOnCloser{w, false}
 }
 
-type ioret struct {
-	n   int
+type ioret[V any] struct {
+	val V
 	err error
 }
 
-// DeadlineWriter deadline writer with context
+// WithDeadline will execute a function with a deadline and return a value of a given type.
+// If the deadline/context passes before the function finishes executing,
+// the zero value and the context error is returned.
+func WithDeadline[V any](ctx context.Context, timeout time.Duration, work func(ctx context.Context) (result V, err error)) (result V, err error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	c := make(chan ioret[V], 1)
+	go func() {
+		v, err := work(ctx)
+		c <- ioret[V]{val: v, err: err}
+	}()
+
+	select {
+	case v := <-c:
+		return v.val, v.err
+	case <-ctx.Done():
+		var zero V
+		return zero, ctx.Err()
+	}
+}
+
+// DeadlineWorker implements the deadline/timeout resiliency pattern.
+type DeadlineWorker struct {
+	timeout time.Duration
+}
+
+// NewDeadlineWorker constructs a new DeadlineWorker with the given timeout.
+// To return values, use the WithDeadline helper instead.
+func NewDeadlineWorker(timeout time.Duration) *DeadlineWorker {
+	dw := &DeadlineWorker{
+		timeout: timeout,
+	}
+	return dw
+}
+
+// Run runs the given function, passing it a stopper channel. If the deadline passes before
+// the function finishes executing, Run returns context.DeadlineExceeded to the caller.
+// channel so that the work function can attempt to exit gracefully.
+// Multiple calls to Run will run independently of each other.
+func (d *DeadlineWorker) Run(work func() error) error {
+	_, err := WithDeadline[struct{}](context.Background(), d.timeout, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, work()
+	})
+	return err
+}
+
+// DeadlineWriter deadline writer with timeout
 type DeadlineWriter struct {
 	io.WriteCloser
 	timeout time.Duration
@@ -82,7 +172,7 @@ type DeadlineWriter struct {
 // NewDeadlineWriter wraps a writer to make it respect given deadline
 // value per Write(). If there is a blocking write, the returned Writer
 // will return whenever the timer hits (the return values are n=0
-// and err=context.Canceled.)
+// and err=context.DeadlineExceeded.)
 func NewDeadlineWriter(w io.WriteCloser, timeout time.Duration) io.WriteCloser {
 	return &DeadlineWriter{WriteCloser: w, timeout: timeout}
 }
@@ -92,29 +182,21 @@ func (w *DeadlineWriter) Write(buf []byte) (int, error) {
 		return 0, w.err
 	}
 
-	c := make(chan ioret, 1)
-	t := time.NewTimer(w.timeout)
-	defer t.Stop()
-
-	go func() {
-		n, err := w.WriteCloser.Write(buf)
-		c <- ioret{n, err}
-		close(c)
-	}()
-
-	select {
-	case r := <-c:
-		w.err = r.err
-		return r.n, r.err
-	case <-t.C:
-		w.err = context.Canceled
-		return 0, context.Canceled
-	}
+	n, err := WithDeadline[int](context.Background(), w.timeout, func(ctx context.Context) (int, error) {
+		return w.WriteCloser.Write(buf)
+	})
+	w.err = err
+	return n, err
 }
 
 // Close closer interface to close the underlying closer
 func (w *DeadlineWriter) Close() error {
-	return w.WriteCloser.Close()
+	err := w.WriteCloser.Close()
+	w.err = err
+	if err == nil {
+		w.err = errors.New("we are closed") // Avoids any reuse on the Write() side.
+	}
+	return err
 }
 
 // LimitWriter implements io.WriteCloser.
@@ -135,7 +217,7 @@ func (w *LimitWriter) Write(p []byte) (n int, err error) {
 	var n1 int
 	if w.skipBytes > 0 {
 		if w.skipBytes >= int64(len(p)) {
-			w.skipBytes = w.skipBytes - int64(len(p))
+			w.skipBytes -= int64(len(p))
 			return n, nil
 		}
 		p = p[w.skipBytes:]
@@ -146,11 +228,11 @@ func (w *LimitWriter) Write(p []byte) (n int, err error) {
 	}
 	if w.wLimit < int64(len(p)) {
 		n1, err = w.Writer.Write(p[:w.wLimit])
-		w.wLimit = w.wLimit - int64(n1)
+		w.wLimit -= int64(n1)
 		return n, err
 	}
 	n1, err = w.Writer.Write(p)
-	w.wLimit = w.wLimit - int64(n1)
+	w.wLimit -= int64(n1)
 	return n, err
 }
 
@@ -192,15 +274,25 @@ func (s *SkipReader) Read(p []byte) (int, error) {
 	if l == 0 {
 		return 0, nil
 	}
-	for s.skipCount > 0 {
-		if l > s.skipCount {
-			l = s.skipCount
+	if s.skipCount > 0 {
+		tmp := p
+		if s.skipCount > l && l < SmallBlock {
+			// We may get a very small buffer, so we grab a temporary buffer.
+			bufp := ODirectPoolSmall.Get()
+			tmp = *bufp
+			defer ODirectPoolSmall.Put(bufp)
+			l = int64(len(tmp))
 		}
-		n, err := s.Reader.Read(p[:l])
-		if err != nil {
-			return 0, err
+		for s.skipCount > 0 {
+			if l > s.skipCount {
+				l = s.skipCount
+			}
+			n, err := s.Reader.Read(tmp[:l])
+			if err != nil {
+				return 0, err
+			}
+			s.skipCount -= int64(n)
 		}
-		s.skipCount -= int64(n)
 	}
 	return s.Reader.Read(p)
 }
@@ -208,6 +300,21 @@ func (s *SkipReader) Read(p []byte) (int, error) {
 // NewSkipReader - creates a SkipReader
 func NewSkipReader(r io.Reader, n int64) io.Reader {
 	return &SkipReader{r, n}
+}
+
+// writerOnly hides an io.Writer value's optional ReadFrom method
+// from io.Copy.
+type writerOnly struct {
+	io.Writer
+}
+
+// Copy is exactly like io.Copy but with reusable buffers.
+func Copy(dst io.Writer, src io.Reader) (written int64, err error) {
+	bufp := ODirectPoolMedium.Get()
+	defer ODirectPoolMedium.Put(bufp)
+	buf := *bufp
+
+	return io.CopyBuffer(writerOnly{dst}, src, buf)
 }
 
 // SameFile returns if the files are same.
@@ -221,15 +328,12 @@ func SameFile(fi1, fi2 os.FileInfo) bool {
 	if fi1.Mode() != fi2.Mode() {
 		return false
 	}
-	if fi1.Size() != fi2.Size() {
-		return false
-	}
-	return true
+	return fi1.Size() == fi2.Size()
 }
 
-// DirectIO alignment needs to be 4K. Defined here as
+// DirectioAlignSize - DirectIO alignment needs to be 4K. Defined here as
 // directio.AlignSize is defined as 0 in MacOS causing divide by 0 error.
-const directioAlignSize = 4096
+const DirectioAlignSize = 4096
 
 // CopyAligned - copies from reader to writer using the aligned input
 // buffer, it is expected that input buffer is page aligned to
@@ -240,61 +344,97 @@ const directioAlignSize = 4096
 // used with DIRECT I/O based file descriptor and it is expected that
 // input writer *os.File not a generic io.Writer. Make sure to have
 // the file opened for writes with syscall.O_DIRECT flag.
-func CopyAligned(w *os.File, r io.Reader, alignedBuf []byte, totalSize int64) (int64, error) {
-	// Writes remaining bytes in the buffer.
-	writeUnaligned := func(w *os.File, buf []byte) (remainingWritten int64, err error) {
-		// Disable O_DIRECT on fd's on unaligned buffer
-		// perform an amortized Fdatasync(fd) on the fd at
-		// the end, this is performed by the caller before
-		// closing 'w'.
-		if err = disk.DisableDirectIO(w); err != nil {
-			return remainingWritten, err
-		}
-		return io.Copy(w, bytes.NewReader(buf))
+func CopyAligned(w io.Writer, r io.Reader, alignedBuf []byte, totalSize int64, file *os.File) (int64, error) {
+	if totalSize == 0 {
+		return 0, nil
 	}
 
 	var written int64
 	for {
 		buf := alignedBuf
-		if totalSize != -1 {
+		if totalSize > 0 {
 			remaining := totalSize - written
 			if remaining < int64(len(buf)) {
 				buf = buf[:remaining]
 			}
 		}
+
 		nr, err := io.ReadFull(r, buf)
-		eof := err == io.EOF || err == io.ErrUnexpectedEOF
+		eof := errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 		if err != nil && !eof {
 			return written, err
 		}
+
 		buf = buf[:nr]
-		var nw int64
-		if len(buf)%directioAlignSize == 0 {
-			var n int
+		var (
+			n  int
+			un int
+			nw int64
+		)
+
+		remain := len(buf) % DirectioAlignSize
+		if remain == 0 {
 			// buf is aligned for directio write()
 			n, err = w.Write(buf)
 			nw = int64(n)
 		} else {
+			if remain < len(buf) {
+				n, err = w.Write(buf[:len(buf)-remain])
+				if err != nil {
+					return written, err
+				}
+				nw = int64(n)
+			}
+
+			// Disable O_DIRECT on fd's on unaligned buffer
+			// perform an amortized Fdatasync(fd) on the fd at
+			// the end, this is performed by the caller before
+			// closing 'w'.
+			if err = disk.DisableDirectIO(file); err != nil {
+				return written, err
+			}
+
 			// buf is not aligned, hence use writeUnaligned()
-			nw, err = writeUnaligned(w, buf)
+			// for the remainder
+			un, err = w.Write(buf[len(buf)-remain:])
+			nw += int64(un)
 		}
+
 		if nw > 0 {
 			written += nw
 		}
+
 		if err != nil {
 			return written, err
 		}
+
 		if nw != int64(len(buf)) {
 			return written, io.ErrShortWrite
 		}
 
-		if totalSize != -1 {
-			if written == totalSize {
-				return written, nil
-			}
+		if totalSize > 0 && written == totalSize {
+			// we have written the entire stream, return right here.
+			return written, nil
 		}
+
 		if eof {
+			// We reached EOF prematurely but we did not write everything
+			// that we promised that we would write.
+			if totalSize > 0 && written != totalSize {
+				return written, io.ErrUnexpectedEOF
+			}
 			return written, nil
 		}
 	}
+}
+
+// SafeClose safely closes any channel of any type
+func SafeClose[T any](c chan<- T) {
+	if c != nil {
+		close(c)
+		return
+	}
+	// Print stack to check who is sending `c` as `nil`
+	// without crashing the server.
+	debug.PrintStack()
 }

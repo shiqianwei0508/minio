@@ -46,8 +46,11 @@ var (
 // the type may not be determined yet. In these cases, a byte-slice is
 // used.
 type Value struct {
-	value interface{}
+	value any
 }
+
+// Missing is used to indicate a non-existing value.
+type Missing struct{}
 
 // MarshalJSON provides json marshaling of values.
 func (v Value) MarshalJSON() ([]byte, error) {
@@ -76,6 +79,8 @@ func (v Value) GetTypeString() string {
 		return "BYTES"
 	case []Value:
 		return "ARRAY"
+	case Missing:
+		return "MISSING"
 	}
 	return "--"
 }
@@ -104,6 +109,8 @@ func (v Value) Repr() string {
 		}
 		s.WriteString("]:ARRAY")
 		return s.String()
+	case Missing:
+		return ":MISSING"
 	default:
 		return fmt.Sprintf("%v:INVALID", v.value)
 	}
@@ -139,6 +146,11 @@ func FromNull() *Value {
 	return &Value{value: nil}
 }
 
+// FromMissing creates a Value with Missing value
+func FromMissing() *Value {
+	return &Value{value: Missing{}}
+}
+
 // FromBytes creates a Value from a []byte
 func FromBytes(b []byte) *Value {
 	return &Value{value: b}
@@ -163,13 +175,13 @@ func (v Value) ToFloat() (val float64, ok bool) {
 // ToInt returns the value if int.
 func (v Value) ToInt() (val int64, ok bool) {
 	val, ok = v.value.(int64)
-	return
+	return val, ok
 }
 
 // ToString returns the value if string.
 func (v Value) ToString() (val string, ok bool) {
 	val, ok = v.value.(string)
-	return
+	return val, ok
 }
 
 // Equals returns whether the values strictly match.
@@ -208,34 +220,41 @@ func (v Value) SameTypeAs(b Value) (ok bool) {
 // conversion succeeded.
 func (v Value) ToBool() (val bool, ok bool) {
 	val, ok = v.value.(bool)
-	return
+	return val, ok
 }
 
 // ToTimestamp returns the timestamp value if present.
 func (v Value) ToTimestamp() (t time.Time, ok bool) {
 	t, ok = v.value.(time.Time)
-	return
+	return t, ok
 }
 
 // ToBytes returns the value if byte-slice.
 func (v Value) ToBytes() (val []byte, ok bool) {
 	val, ok = v.value.([]byte)
-	return
+	return val, ok
 }
 
 // ToArray returns the value if it is a slice of values.
 func (v Value) ToArray() (val []Value, ok bool) {
 	val, ok = v.value.([]Value)
-	return
+	return val, ok
 }
 
 // IsNull - checks if value is missing.
 func (v Value) IsNull() bool {
+	//nolint:gocritic
 	switch v.value.(type) {
 	case nil:
 		return true
 	}
 	return false
+}
+
+// IsMissing - checks if value is missing.
+func (v Value) IsMissing() bool {
+	_, ok := v.value.(Missing)
+	return ok
 }
 
 // IsArray returns whether the value is an array.
@@ -245,6 +264,7 @@ func (v Value) IsArray() (ok bool) {
 }
 
 func (v Value) isNumeric() bool {
+	//nolint:gocritic
 	switch v.value.(type) {
 	case int64, float64:
 		return true
@@ -281,7 +301,7 @@ func (v Value) String() string {
 // CSVString - convert to string for CSV serialization
 func (v Value) CSVString() string {
 	switch x := v.value.(type) {
-	case nil:
+	case nil, Missing:
 		return ""
 	case bool:
 		if x {
@@ -324,12 +344,14 @@ func (v *Value) negate() {
 
 // Supported comparison operators
 const (
-	opLt   = "<"
-	opLte  = "<="
-	opGt   = ">"
-	opGte  = ">="
-	opEq   = "="
-	opIneq = "!="
+	opLt    = "<"
+	opLte   = "<="
+	opGt    = ">"
+	opGte   = ">="
+	opEq    = "="
+	opIneq  = "!="
+	opIs    = "IS"
+	opIsNot = "ISNOT"
 )
 
 // InferBytesType will attempt to infer the data type of bytes.
@@ -371,7 +393,7 @@ func (v *Value) InferBytesType() (err error) {
 	}
 	// Fallback to string
 	v.setString(asString)
-	return
+	return err
 }
 
 // When numeric types are compared, type promotions could happen. If
@@ -382,6 +404,29 @@ func (v *Value) InferBytesType() (err error) {
 func (v *Value) compareOp(op string, a *Value) (res bool, err error) {
 	if !isValidComparisonOperator(op) {
 		return false, errArithInvalidOperator
+	}
+	switch op {
+	case opIs:
+		if a.IsNull() {
+			// Missing is null
+			return v.IsNull() || v.IsMissing(), nil
+		}
+		if a.IsMissing() {
+			return v.IsMissing(), nil
+		}
+		// Forward to Equal
+		op = opEq
+	case opIsNot:
+		if a.IsNull() {
+			// Missing is not null
+			return !v.IsNull() && !v.IsMissing(), nil
+		}
+		if a.IsMissing() {
+			return !v.IsMissing(), nil
+		}
+		// Forward to not equal.
+		op = opIneq
+	default:
 	}
 
 	// Check if type conversion/inference is needed - it is needed
@@ -395,6 +440,11 @@ func (v *Value) compareOp(op string, a *Value) (res bool, err error) {
 	if v.IsNull() || a.IsNull() {
 		// If one is, both must be.
 		return boolCompare(op, v.IsNull(), a.IsNull())
+	}
+
+	if a.IsMissing() || v.IsMissing() {
+		// If one is, both must be.
+		return boolCompare(op, v.IsMissing(), a.IsMissing())
 	}
 
 	// Check array values
@@ -613,8 +663,13 @@ func inferTypeForArithOp(a *Value) error {
 		a.setFloat(f)
 		return nil
 	}
-
-	err := fmt.Errorf("Could not convert %q to a number", string(a.value.([]byte)))
+	var s string
+	if v, ok := a.value.([]byte); ok {
+		s = string(v)
+	} else {
+		s = fmt.Sprint(a.value)
+	}
+	err := fmt.Errorf("Could not convert %q to a number", s)
 	return errInvalidDataType(err)
 }
 
@@ -745,12 +800,7 @@ func inferTypeAsString(v *Value) {
 
 func isValidComparisonOperator(op string) bool {
 	switch op {
-	case opLt:
-	case opLte:
-	case opGt:
-	case opGte:
-	case opEq:
-	case opIneq:
+	case opLt, opLte, opGt, opGte, opEq, opIneq, opIs, opIsNot:
 	default:
 		return false
 	}

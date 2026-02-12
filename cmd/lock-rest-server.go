@@ -18,24 +18,12 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
-	"errors"
-	"net/http"
-	"sort"
-	"strconv"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/minio/minio/internal/dsync"
-)
-
-const (
-	// Lock maintenance interval.
-	lockMaintenanceInterval = 1 * time.Minute
-
-	// Lock validity duration
-	lockValidityDuration = 20 * time.Second
+	"github.com/minio/minio/internal/grid"
+	"github.com/minio/minio/internal/logger"
 )
 
 // To abstract a node over network.
@@ -43,211 +31,142 @@ type lockRESTServer struct {
 	ll *localLocker
 }
 
-func (l *lockRESTServer) writeErrorResponse(w http.ResponseWriter, err error) {
-	w.WriteHeader(http.StatusForbidden)
-	w.Write([]byte(err.Error()))
-}
-
-// IsValid - To authenticate and verify the time difference.
-func (l *lockRESTServer) IsValid(w http.ResponseWriter, r *http.Request) bool {
-	if l.ll == nil {
-		l.writeErrorResponse(w, errLockNotInitialized)
-		return false
-	}
-
-	if err := storageServerRequestValidate(r); err != nil {
-		l.writeErrorResponse(w, err)
-		return false
-	}
-	return true
-}
-
-func getLockArgs(r *http.Request) (args dsync.LockArgs, err error) {
-	values := r.Form
-	quorum, err := strconv.Atoi(values.Get(lockRESTQuorum))
-	if err != nil {
-		return args, err
-	}
-
-	args = dsync.LockArgs{
-		Owner:  values.Get(lockRESTOwner),
-		UID:    values.Get(lockRESTUID),
-		Source: values.Get(lockRESTSource),
-		Quorum: quorum,
-	}
-
-	var resources []string
-	bio := bufio.NewScanner(r.Body)
-	for bio.Scan() {
-		resources = append(resources, bio.Text())
-	}
-
-	if err := bio.Err(); err != nil {
-		return args, err
-	}
-
-	sort.Strings(resources)
-	args.Resources = resources
-	return args, nil
-}
-
-// HealthHandler returns success if request is authenticated.
-func (l *lockRESTServer) HealthHandler(w http.ResponseWriter, r *http.Request) {
-	l.IsValid(w, r)
-}
-
 // RefreshHandler - refresh the current lock
-func (l *lockRESTServer) RefreshHandler(w http.ResponseWriter, r *http.Request) {
-	if !l.IsValid(w, r) {
-		l.writeErrorResponse(w, errors.New("invalid request"))
-		return
-	}
+func (l *lockRESTServer) RefreshHandler(args *dsync.LockArgs) (*dsync.LockResp, *grid.RemoteErr) {
+	// Add a timeout similar to what we expect upstream.
+	ctx, cancel := context.WithTimeout(context.Background(), dsync.DefaultTimeouts.RefreshCall)
+	defer cancel()
 
-	args, err := getLockArgs(r)
+	resp := lockRPCRefresh.NewResponse()
+	refreshed, err := l.ll.Refresh(ctx, *args)
 	if err != nil {
-		l.writeErrorResponse(w, err)
-		return
+		return l.makeResp(resp, err)
 	}
-
-	refreshed, err := l.ll.Refresh(r.Context(), args)
-	if err != nil {
-		l.writeErrorResponse(w, err)
-		return
-	}
-
 	if !refreshed {
-		l.writeErrorResponse(w, errLockNotFound)
-		return
+		return l.makeResp(resp, errLockNotFound)
 	}
+	return l.makeResp(resp, err)
 }
 
 // LockHandler - Acquires a lock.
-func (l *lockRESTServer) LockHandler(w http.ResponseWriter, r *http.Request) {
-	if !l.IsValid(w, r) {
-		l.writeErrorResponse(w, errors.New("invalid request"))
-		return
-	}
-
-	args, err := getLockArgs(r)
-	if err != nil {
-		l.writeErrorResponse(w, err)
-		return
-	}
-
-	success, err := l.ll.Lock(r.Context(), args)
+func (l *lockRESTServer) LockHandler(args *dsync.LockArgs) (*dsync.LockResp, *grid.RemoteErr) {
+	// Add a timeout similar to what we expect upstream.
+	ctx, cancel := context.WithTimeout(context.Background(), dsync.DefaultTimeouts.Acquire)
+	defer cancel()
+	resp := lockRPCLock.NewResponse()
+	success, err := l.ll.Lock(ctx, *args)
 	if err == nil && !success {
-		err = errLockConflict
+		return l.makeResp(resp, errLockConflict)
 	}
-	if err != nil {
-		l.writeErrorResponse(w, err)
-		return
-	}
+	return l.makeResp(resp, err)
 }
 
 // UnlockHandler - releases the acquired lock.
-func (l *lockRESTServer) UnlockHandler(w http.ResponseWriter, r *http.Request) {
-	if !l.IsValid(w, r) {
-		l.writeErrorResponse(w, errors.New("invalid request"))
-		return
-	}
-
-	args, err := getLockArgs(r)
-	if err != nil {
-		l.writeErrorResponse(w, err)
-		return
-	}
-
-	_, err = l.ll.Unlock(context.Background(), args)
+func (l *lockRESTServer) UnlockHandler(args *dsync.LockArgs) (*dsync.LockResp, *grid.RemoteErr) {
+	resp := lockRPCUnlock.NewResponse()
+	_, err := l.ll.Unlock(context.Background(), *args)
 	// Ignore the Unlock() "reply" return value because if err == nil, "reply" is always true
 	// Consequently, if err != nil, reply is always false
-	if err != nil {
-		l.writeErrorResponse(w, err)
-		return
-	}
+	return l.makeResp(resp, err)
 }
 
-// LockHandler - Acquires an RLock.
-func (l *lockRESTServer) RLockHandler(w http.ResponseWriter, r *http.Request) {
-	if !l.IsValid(w, r) {
-		l.writeErrorResponse(w, errors.New("invalid request"))
-		return
-	}
-
-	args, err := getLockArgs(r)
-	if err != nil {
-		l.writeErrorResponse(w, err)
-		return
-	}
-
-	success, err := l.ll.RLock(r.Context(), args)
+// RLockHandler - Acquires an RLock.
+func (l *lockRESTServer) RLockHandler(args *dsync.LockArgs) (*dsync.LockResp, *grid.RemoteErr) {
+	// Add a timeout similar to what we expect upstream.
+	ctx, cancel := context.WithTimeout(context.Background(), dsync.DefaultTimeouts.Acquire)
+	defer cancel()
+	resp := lockRPCRLock.NewResponse()
+	success, err := l.ll.RLock(ctx, *args)
 	if err == nil && !success {
 		err = errLockConflict
 	}
-	if err != nil {
-		l.writeErrorResponse(w, err)
-		return
-	}
+	return l.makeResp(resp, err)
 }
 
 // RUnlockHandler - releases the acquired read lock.
-func (l *lockRESTServer) RUnlockHandler(w http.ResponseWriter, r *http.Request) {
-	if !l.IsValid(w, r) {
-		l.writeErrorResponse(w, errors.New("invalid request"))
-		return
-	}
-
-	args, err := getLockArgs(r)
-	if err != nil {
-		l.writeErrorResponse(w, err)
-		return
-	}
+func (l *lockRESTServer) RUnlockHandler(args *dsync.LockArgs) (*dsync.LockResp, *grid.RemoteErr) {
+	resp := lockRPCRUnlock.NewResponse()
 
 	// Ignore the RUnlock() "reply" return value because if err == nil, "reply" is always true.
 	// Consequently, if err != nil, reply is always false
-	if _, err = l.ll.RUnlock(context.Background(), args); err != nil {
-		l.writeErrorResponse(w, err)
-		return
-	}
+	_, err := l.ll.RUnlock(context.Background(), *args)
+	return l.makeResp(resp, err)
 }
 
 // ForceUnlockHandler - query expired lock status.
-func (l *lockRESTServer) ForceUnlockHandler(w http.ResponseWriter, r *http.Request) {
-	if !l.IsValid(w, r) {
-		l.writeErrorResponse(w, errors.New("invalid request"))
-		return
-	}
+func (l *lockRESTServer) ForceUnlockHandler(args *dsync.LockArgs) (*dsync.LockResp, *grid.RemoteErr) {
+	resp := lockRPCForceUnlock.NewResponse()
 
-	args, err := getLockArgs(r)
-	if err != nil {
-		l.writeErrorResponse(w, err)
-		return
-	}
-
-	if _, err = l.ll.ForceUnlock(r.Context(), args); err != nil {
-		l.writeErrorResponse(w, err)
-		return
-	}
+	_, err := l.ll.ForceUnlock(context.Background(), *args)
+	return l.makeResp(resp, err)
 }
+
+var (
+	// Static lock handlers.
+	// All have the same signature.
+	lockRPCForceUnlock = newLockHandler(grid.HandlerLockForceUnlock)
+	lockRPCRefresh     = newLockHandler(grid.HandlerLockRefresh)
+	lockRPCLock        = newLockHandler(grid.HandlerLockLock)
+	lockRPCUnlock      = newLockHandler(grid.HandlerLockUnlock)
+	lockRPCRLock       = newLockHandler(grid.HandlerLockRLock)
+	lockRPCRUnlock     = newLockHandler(grid.HandlerLockRUnlock)
+)
+
+func newLockHandler(h grid.HandlerID) *grid.SingleHandler[*dsync.LockArgs, *dsync.LockResp] {
+	return grid.NewSingleHandler[*dsync.LockArgs, *dsync.LockResp](h, func() *dsync.LockArgs {
+		return &dsync.LockArgs{}
+	}, func() *dsync.LockResp {
+		return &dsync.LockResp{}
+	})
+}
+
+// registerLockRESTHandlers - register lock rest router.
+func registerLockRESTHandlers(gm *grid.Manager) {
+	lockServer := &lockRESTServer{
+		ll: newLocker(),
+	}
+
+	logger.FatalIf(lockRPCForceUnlock.Register(gm, lockServer.ForceUnlockHandler), "unable to register handler")
+	logger.FatalIf(lockRPCRefresh.Register(gm, lockServer.RefreshHandler), "unable to register handler")
+	logger.FatalIf(lockRPCLock.Register(gm, lockServer.LockHandler), "unable to register handler")
+	logger.FatalIf(lockRPCUnlock.Register(gm, lockServer.UnlockHandler), "unable to register handler")
+	logger.FatalIf(lockRPCRLock.Register(gm, lockServer.RLockHandler), "unable to register handler")
+	logger.FatalIf(lockRPCRUnlock.Register(gm, lockServer.RUnlockHandler), "unable to register handler")
+
+	globalLockServer = lockServer.ll
+
+	go lockMaintenance(GlobalContext)
+}
+
+func (l *lockRESTServer) makeResp(dst *dsync.LockResp, err error) (*dsync.LockResp, *grid.RemoteErr) {
+	*dst = dsync.LockResp{Code: dsync.RespOK}
+	switch err {
+	case nil:
+	case errLockNotInitialized:
+		dst.Code = dsync.RespLockNotInitialized
+	case errLockConflict:
+		dst.Code = dsync.RespLockConflict
+	case errLockNotFound:
+		dst.Code = dsync.RespLockNotFound
+	default:
+		dst.Code = dsync.RespErr
+		dst.Err = err.Error()
+	}
+	return dst, nil
+}
+
+const (
+	// Lock maintenance interval.
+	lockMaintenanceInterval = 1 * time.Minute
+
+	// Lock validity duration
+	lockValidityDuration = 1 * time.Minute
+)
 
 // lockMaintenance loops over all locks and discards locks
 // that have not been refreshed for some time.
 func lockMaintenance(ctx context.Context) {
-	// Wait until the object API is ready
-	// no need to start the lock maintenance
-	// if ObjectAPI is not initialized.
-
-	var objAPI ObjectLayer
-
-	for {
-		objAPI = newObjectLayerFn()
-		if objAPI == nil {
-			time.Sleep(time.Second)
-			continue
-		}
-		break
-	}
-
-	if _, ok := objAPI.(*erasureServerPools); !ok {
+	if !globalIsDistErasure {
 		return
 	}
 
@@ -262,30 +181,10 @@ func lockMaintenance(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-lkTimer.C:
+			globalLockServer.expireOldLocks(lockValidityDuration)
+
 			// Reset the timer for next cycle.
 			lkTimer.Reset(lockMaintenanceInterval)
-
-			globalLockServer.expireOldLocks(lockValidityDuration)
 		}
 	}
-}
-
-// registerLockRESTHandlers - register lock rest router.
-func registerLockRESTHandlers(router *mux.Router) {
-	lockServer := &lockRESTServer{
-		ll: newLocker(),
-	}
-
-	subrouter := router.PathPrefix(lockRESTPrefix).Subrouter()
-	subrouter.Methods(http.MethodPost).Path(lockRESTVersionPrefix + lockRESTMethodHealth).HandlerFunc(httpTraceHdrs(lockServer.HealthHandler))
-	subrouter.Methods(http.MethodPost).Path(lockRESTVersionPrefix + lockRESTMethodRefresh).HandlerFunc(httpTraceHdrs(lockServer.RefreshHandler))
-	subrouter.Methods(http.MethodPost).Path(lockRESTVersionPrefix + lockRESTMethodLock).HandlerFunc(httpTraceHdrs(lockServer.LockHandler))
-	subrouter.Methods(http.MethodPost).Path(lockRESTVersionPrefix + lockRESTMethodRLock).HandlerFunc(httpTraceHdrs(lockServer.RLockHandler))
-	subrouter.Methods(http.MethodPost).Path(lockRESTVersionPrefix + lockRESTMethodUnlock).HandlerFunc(httpTraceHdrs(lockServer.UnlockHandler))
-	subrouter.Methods(http.MethodPost).Path(lockRESTVersionPrefix + lockRESTMethodRUnlock).HandlerFunc(httpTraceHdrs(lockServer.RUnlockHandler))
-	subrouter.Methods(http.MethodPost).Path(lockRESTVersionPrefix + lockRESTMethodForceUnlock).HandlerFunc(httpTraceAll(lockServer.ForceUnlockHandler))
-
-	globalLockServer = lockServer.ll
-
-	go lockMaintenance(GlobalContext)
 }

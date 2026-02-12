@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -24,53 +24,68 @@ import (
 	"strings"
 	"time"
 
+	"github.com/minio/madmin-go/v3/logger/log"
 	"github.com/minio/minio/internal/color"
-	"github.com/minio/minio/internal/logger/message/log"
-	c "github.com/minio/pkg/console"
 )
+
+// ConsoleLoggerTgt is a stringified value to represent console logging
+const ConsoleLoggerTgt = "console+http"
+
+// ExitFunc is called by Fatal() class functions, by default it calls os.Exit()
+var ExitFunc = os.Exit
 
 // Logger interface describes the methods that need to be implemented to satisfy the interface requirements.
 type Logger interface {
-	json(msg string, args ...interface{})
-	quiet(msg string, args ...interface{})
-	pretty(msg string, args ...interface{})
+	json(msg string, args ...any)
+	quiet(msg string, args ...any)
+	pretty(msg string, args ...any)
 }
 
-func consoleLog(console Logger, msg string, args ...interface{}) {
+func consoleLog(console Logger, msg string, args ...any) {
 	switch {
 	case jsonFlag:
 		// Strip escape control characters from json message
 		msg = ansiRE.ReplaceAllLiteralString(msg, "")
 		console.json(msg, args...)
 	case quietFlag:
+		if len(msg) != 0 && len(args) == 0 {
+			args = append(args, msg)
+			msg = "%s"
+		}
 		console.quiet(msg+"\n", args...)
 	default:
+		if len(msg) != 0 && len(args) == 0 {
+			args = append(args, msg)
+			msg = "%s"
+		}
 		console.pretty(msg+"\n", args...)
 	}
 }
 
 // Fatal prints only fatal error message with no stack trace
 // it will be called for input validation failures
-func Fatal(err error, msg string, data ...interface{}) {
+func Fatal(err error, msg string, data ...any) {
 	fatal(err, msg, data...)
 }
 
-func fatal(err error, msg string, data ...interface{}) {
-	var errMsg string
-	if msg != "" {
-		errMsg = errorFmtFunc(fmt.Sprintf(msg, data...), err, jsonFlag)
+func fatal(err error, msg string, data ...any) {
+	if msg == "" {
+		if len(data) > 0 {
+			msg = fmt.Sprint(data...)
+		} else {
+			msg = "a fatal error"
+		}
 	} else {
-		errMsg = err.Error()
+		msg = fmt.Sprintf(msg, data...)
 	}
-	consoleLog(fatalMessage, errMsg)
+	consoleLog(fatalMessage, errorFmtFunc(msg, err, jsonFlag))
 }
 
 var fatalMessage fatalMsg
 
-type fatalMsg struct {
-}
+type fatalMsg struct{}
 
-func (f fatalMsg) json(msg string, args ...interface{}) {
+func (f fatalMsg) json(msg string, args ...any) {
 	var message string
 	if msg != "" {
 		message = fmt.Sprintf(msg, args...)
@@ -78,32 +93,30 @@ func (f fatalMsg) json(msg string, args ...interface{}) {
 		message = fmt.Sprint(args...)
 	}
 	logJSON, err := json.Marshal(&log.Entry{
-		Level:   FatalLvl.String(),
+		Level:   FatalKind,
 		Message: message,
-		Time:    time.Now().UTC().Format(time.RFC3339Nano),
+		Time:    time.Now().UTC(),
 		Trace:   &log.Trace{Message: message, Source: []string{getSource(6)}},
 	})
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println(string(logJSON))
-
-	os.Exit(1)
-
+	fmt.Fprintln(Output, string(logJSON))
+	ExitFunc(1)
 }
 
-func (f fatalMsg) quiet(msg string, args ...interface{}) {
+func (f fatalMsg) quiet(msg string, args ...any) {
 	f.pretty(msg, args...)
 }
 
 var (
-	logTag      = "ERROR"
+	logTag      = "FATAL"
 	logBanner   = color.BgRed(color.FgWhite(color.Bold(logTag))) + " "
 	emptyBanner = color.BgRed(strings.Repeat(" ", len(logTag))) + " "
 	bannerWidth = len(logTag) + 1
 )
 
-func (f fatalMsg) pretty(msg string, args ...interface{}) {
+func (f fatalMsg) pretty(msg string, args ...any) {
 	// Build the passed error message
 	errMsg := fmt.Sprintf(msg, args...)
 
@@ -115,41 +128,38 @@ func (f fatalMsg) pretty(msg string, args ...interface{}) {
 	// message itself contains some colored text, we needed
 	// to use some ANSI control escapes to cursor color state
 	// and freely move in the screen.
-	for _, line := range strings.Split(errMsg, "\n") {
+	for line := range strings.SplitSeq(errMsg, "\n") {
 		if len(line) == 0 {
 			// No more text to print, just quit.
 			break
 		}
 
-		for {
-			// Save the attributes of the current cursor helps
-			// us save the text color of the passed error message
-			ansiSaveAttributes()
-			// Print banner with or without the log tag
-			if !tagPrinted {
-				c.Print(logBanner)
-				tagPrinted = true
-			} else {
-				c.Print(emptyBanner)
-			}
-			// Restore the text color of the error message
-			ansiRestoreAttributes()
-			ansiMoveRight(bannerWidth)
-			// Continue  error message printing
-			c.Println(line)
-			break
+		// Save the attributes of the current cursor helps
+		// us save the text color of the passed error message
+		ansiSaveAttributes()
+		// Print banner with or without the log tag
+		if !tagPrinted {
+			fmt.Fprint(Output, logBanner)
+			tagPrinted = true
+		} else {
+			fmt.Fprint(Output, emptyBanner)
 		}
+		// Restore the text color of the error message
+		ansiRestoreAttributes()
+		ansiMoveRight(bannerWidth)
+		// Continue  error message printing
+		fmt.Fprintln(Output, line)
 	}
 
 	// Exit because this is a fatal error message
-	os.Exit(1)
+	ExitFunc(1)
 }
 
 type infoMsg struct{}
 
 var info infoMsg
 
-func (i infoMsg) json(msg string, args ...interface{}) {
+func (i infoMsg) json(msg string, args ...any) {
 	var message string
 	if msg != "" {
 		message = fmt.Sprintf(msg, args...)
@@ -157,32 +167,32 @@ func (i infoMsg) json(msg string, args ...interface{}) {
 		message = fmt.Sprint(args...)
 	}
 	logJSON, err := json.Marshal(&log.Entry{
-		Level:   InformationLvl.String(),
+		Level:   InfoKind,
 		Message: message,
-		Time:    time.Now().UTC().Format(time.RFC3339Nano),
+		Time:    time.Now().UTC(),
 	})
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println(string(logJSON))
+	fmt.Fprintln(Output, string(logJSON))
 }
 
-func (i infoMsg) quiet(msg string, args ...interface{}) {
-	i.pretty(msg, args...)
+func (i infoMsg) quiet(msg string, args ...any) {
 }
 
-func (i infoMsg) pretty(msg string, args ...interface{}) {
+func (i infoMsg) pretty(msg string, args ...any) {
 	if msg == "" {
-		c.Println(args...)
+		fmt.Fprintln(Output, args...)
+	} else {
+		fmt.Fprintf(Output, `INFO: `+msg, args...)
 	}
-	c.Printf(msg, args...)
 }
 
 type errorMsg struct{}
 
-var errorm errorMsg
+var errorMessage errorMsg
 
-func (i errorMsg) json(msg string, args ...interface{}) {
+func (i errorMsg) json(msg string, args ...any) {
 	var message string
 	if msg != "" {
 		message = fmt.Sprintf(msg, args...)
@@ -190,54 +200,125 @@ func (i errorMsg) json(msg string, args ...interface{}) {
 		message = fmt.Sprint(args...)
 	}
 	logJSON, err := json.Marshal(&log.Entry{
-		Level:   ErrorLvl.String(),
+		Level:   ErrorKind,
 		Message: message,
-		Time:    time.Now().UTC().Format(time.RFC3339Nano),
+		Time:    time.Now().UTC(),
 		Trace:   &log.Trace{Message: message, Source: []string{getSource(6)}},
 	})
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println(string(logJSON))
+	fmt.Fprintln(Output, string(logJSON))
 }
 
-func (i errorMsg) quiet(msg string, args ...interface{}) {
+func (i errorMsg) quiet(msg string, args ...any) {
 	i.pretty(msg, args...)
 }
 
-func (i errorMsg) pretty(msg string, args ...interface{}) {
+func (i errorMsg) pretty(msg string, args ...any) {
 	if msg == "" {
-		c.Println(args...)
+		fmt.Fprintln(Output, args...)
+	} else {
+		fmt.Fprintf(Output, `ERRO: `+msg, args...)
 	}
-	c.Printf(msg, args...)
 }
 
 // Error :
-func Error(msg string, data ...interface{}) {
-	consoleLog(errorm, msg, data...)
+func Error(msg string, data ...any) {
+	if DisableLog {
+		return
+	}
+	consoleLog(errorMessage, msg, data...)
 }
 
 // Info :
-func Info(msg string, data ...interface{}) {
+func Info(msg string, data ...any) {
+	if DisableLog {
+		return
+	}
 	consoleLog(info, msg, data...)
 }
 
-var startupMessage startUpMsg
-
-type startUpMsg struct {
+// Startup :
+func Startup(msg string, data ...any) {
+	if DisableLog {
+		return
+	}
+	consoleLog(startup, msg, data...)
 }
 
-func (s startUpMsg) json(msg string, args ...interface{}) {
+type startupMsg struct{}
+
+var startup startupMsg
+
+func (i startupMsg) json(msg string, args ...any) {
+	var message string
+	if msg != "" {
+		message = fmt.Sprintf(msg, args...)
+	} else {
+		message = fmt.Sprint(args...)
+	}
+	logJSON, err := json.Marshal(&log.Entry{
+		Level:   InfoKind,
+		Message: message,
+		Time:    time.Now().UTC(),
+	})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Fprintln(Output, string(logJSON))
 }
 
-func (s startUpMsg) quiet(msg string, args ...interface{}) {
+func (i startupMsg) quiet(msg string, args ...any) {
 }
 
-func (s startUpMsg) pretty(msg string, args ...interface{}) {
-	c.Printf(msg, args...)
+func (i startupMsg) pretty(msg string, args ...any) {
+	if msg == "" {
+		fmt.Fprintln(Output, args...)
+	} else {
+		fmt.Fprintf(Output, msg, args...)
+	}
 }
 
-// StartupMessage :
-func StartupMessage(msg string, data ...interface{}) {
-	consoleLog(startupMessage, msg, data...)
+type warningMsg struct{}
+
+var warningMessage warningMsg
+
+func (i warningMsg) json(msg string, args ...any) {
+	var message string
+	if msg != "" {
+		message = fmt.Sprintf(msg, args...)
+	} else {
+		message = fmt.Sprint(args...)
+	}
+	logJSON, err := json.Marshal(&log.Entry{
+		Level:   WarningKind,
+		Message: message,
+		Time:    time.Now().UTC(),
+		Trace:   &log.Trace{Message: message, Source: []string{getSource(6)}},
+	})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Fprintln(Output, string(logJSON))
+}
+
+func (i warningMsg) quiet(msg string, args ...any) {
+	i.pretty(msg, args...)
+}
+
+func (i warningMsg) pretty(msg string, args ...any) {
+	if msg == "" {
+		fmt.Fprintln(Output, args...)
+	} else {
+		fmt.Fprintf(Output, `WARN: `+msg, args...)
+	}
+}
+
+// Warning :
+func Warning(msg string, data ...any) {
+	if DisableLog {
+		return
+	}
+	consoleLog(warningMessage, msg, data...)
 }

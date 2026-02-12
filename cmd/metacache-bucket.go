@@ -20,13 +20,14 @@ package cmd
 import (
 	"context"
 	"errors"
+	"maps"
 	"runtime/debug"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 // a bucketMetacache keeps track of all caches generated
@@ -45,16 +46,22 @@ type bucketMetacache struct {
 	updated bool         `msg:"-"`
 }
 
+type deleteAllStorager interface {
+	deleteAll(ctx context.Context, bucket, prefix string)
+}
+
 // newBucketMetacache creates a new bucketMetacache.
 // Optionally remove all existing caches.
 func newBucketMetacache(bucket string, cleanup bool) *bucketMetacache {
 	if cleanup {
 		// Recursively delete all caches.
 		objAPI := newObjectLayerFn()
-		ez, ok := objAPI.(*erasureServerPools)
-		if ok {
-			ctx := context.Background()
-			ez.renameAll(ctx, minioMetaBucket, metacachePrefixForID(bucket, slashSeparator))
+		if objAPI != nil {
+			ez, ok := objAPI.(deleteAllStorager)
+			if ok {
+				ctx := context.Background()
+				ez.deleteAll(ctx, minioMetaBucket, metacachePrefixForID(bucket, slashSeparator))
+			}
 		}
 	}
 	return &bucketMetacache{
@@ -64,7 +71,7 @@ func newBucketMetacache(bucket string, cleanup bool) *bucketMetacache {
 	}
 }
 
-func (b *bucketMetacache) debugf(format string, data ...interface{}) {
+func (b *bucketMetacache) debugf(format string, data ...any) {
 	if serverDebugLog {
 		console.Debugf(format+"\n", data...)
 	}
@@ -189,9 +196,7 @@ func (b *bucketMetacache) cloneCaches() (map[string]metacache, map[string][]stri
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	dst := make(map[string]metacache, len(b.caches))
-	for k, v := range b.caches {
-		dst[k] = v
-	}
+	maps.Copy(dst, b.caches)
 	// Copy indexes
 	dst2 := make(map[string][]string, len(b.cachesRoot))
 	for k, v := range b.cachesRoot {
@@ -207,9 +212,15 @@ func (b *bucketMetacache) cloneCaches() (map[string]metacache, map[string][]stri
 // Deletes are performed concurrently.
 func (b *bucketMetacache) deleteAll() {
 	ctx := context.Background()
-	ez, ok := newObjectLayerFn().(*erasureServerPools)
+
+	objAPI := newObjectLayerFn()
+	if objAPI == nil {
+		return
+	}
+
+	ez, ok := objAPI.(deleteAllStorager)
 	if !ok {
-		logger.LogIf(ctx, errors.New("bucketMetacache: expected objAPI to be *erasurePools"))
+		bugLogIf(ctx, errors.New("bucketMetacache: expected objAPI to be 'deleteAllStorager'"))
 		return
 	}
 
@@ -218,7 +229,7 @@ func (b *bucketMetacache) deleteAll() {
 
 	b.updated = true
 	// Delete all.
-	ez.renameAll(ctx, minioMetaBucket, metacachePrefixForID(b.bucket, slashSeparator))
+	ez.deleteAll(ctx, minioMetaBucket, metacachePrefixForID(b.bucket, slashSeparator))
 	b.caches = make(map[string]metacache, 10)
 	b.cachesRoot = make(map[string][]string, 10)
 }

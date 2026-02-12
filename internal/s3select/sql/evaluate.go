@@ -22,8 +22,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 
-	"github.com/bcicen/jstream"
+	"github.com/minio/minio/internal/s3select/jstream"
 	"github.com/minio/simdjson-go"
 )
 
@@ -69,6 +70,9 @@ func (e *Expression) evalNode(r Record, tableAlias string) (*Value, error) {
 		if !ok {
 			return nil, errExpectedBool
 		}
+		if b {
+			return FromBool(true), nil
+		}
 		result = result || b
 	}
 	return FromBool(result), nil
@@ -90,6 +94,9 @@ func (e *AndCondition) evalNode(r Record, tableAlias string) (*Value, error) {
 		b, ok := res.ToBool()
 		if !ok {
 			return nil, errExpectedBool
+		}
+		if !b {
+			return FromBool(false), nil
 		}
 		result = result && b
 	}
@@ -128,7 +135,7 @@ func (e *ConditionOperand) evalNode(r Record, tableAlias string) (*Value, error)
 			return nil, cmpRErr
 		}
 
-		b, err := opVal.compareOp(e.ConditionRHS.Compare.Operator, cmpRight)
+		b, err := opVal.compareOp(strings.ToUpper(e.ConditionRHS.Compare.Operator), cmpRight)
 		return FromBool(b), err
 
 	case e.ConditionRHS.Between != nil:
@@ -282,13 +289,23 @@ func (e *In) evalInNode(r Record, lhs *Value, tableAlias string) (*Value, error)
 	}
 
 	var rhs Value
-	if elt := e.ListExpression; elt != nil {
-		eltVal, err := elt.evalNode(r, tableAlias)
+	var err error
+	var eltVal *Value
+	switch {
+	case e.JPathExpr != nil:
+		eltVal, err = e.JPathExpr.evalNode(r, tableAlias)
 		if err != nil {
 			return nil, err
 		}
-		rhs = *eltVal
+	case e.ListExpr != nil:
+		eltVal, err = e.ListExpr.evalNode(r, tableAlias)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, errInvalidASTNode
 	}
+	rhs = *eltVal
 
 	// If RHS is array compare each element.
 	if arr, ok := rhs.ToArray(); ok {
@@ -396,7 +413,7 @@ func (e *JSONPath) evalNode(r Record, tableAlias string) (*Value, error) {
 }
 
 // jsonToValue will convert the json value to an internal value.
-func jsonToValue(result interface{}) (*Value, error) {
+func jsonToValue(result any) (*Value, error) {
 	switch rval := result.(type) {
 	case string:
 		return FromString(rval), nil
@@ -417,7 +434,7 @@ func jsonToValue(result interface{}) (*Value, error) {
 			return nil, err
 		}
 		return FromBytes(bs), nil
-	case []interface{}:
+	case []any:
 		dst := make([]Value, len(rval))
 		for i := range rval {
 			v, err := jsonToValue(rval[i])
@@ -442,6 +459,8 @@ func jsonToValue(result interface{}) (*Value, error) {
 		return FromArray(rval), nil
 	case nil:
 		return FromNull(), nil
+	case Missing:
+		return FromMissing(), nil
 	}
 	return nil, fmt.Errorf("Unhandled value type: %T", result)
 }
@@ -486,6 +505,8 @@ func (e *LitValue) evalNode(_ Record) (res *Value, err error) {
 		return FromString(string(*e.String)), nil
 	case e.Boolean != nil:
 		return FromBool(bool(*e.Boolean)), nil
+	case e.Missing:
+		return FromMissing(), nil
 	}
 	return FromNull(), nil
 }

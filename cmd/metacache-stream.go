@@ -27,7 +27,8 @@ import (
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/klauspost/compress/s2"
-	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/bpool"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/tinylib/msgp/msgp"
 	"github.com/valyala/bytebufferpool"
 )
@@ -56,14 +57,13 @@ const metacacheStreamVersion = 2
 
 // metacacheWriter provides a serializer of metacache objects.
 type metacacheWriter struct {
+	streamErr   error
 	mw          *msgp.Writer
 	creator     func() error
 	closer      func() error
 	blockSize   int
+	streamWg    sync.WaitGroup
 	reuseBlocks bool
-
-	streamErr error
-	streamWg  sync.WaitGroup
 }
 
 // newMetacacheWriter will create a serializer that will write objects in given order to the output.
@@ -164,7 +164,7 @@ func (w *metacacheWriter) stream() (chan<- metaCacheEntry, error) {
 			return nil, errors.New("metacacheWriter: writer not initialized")
 		}
 	}
-	var objs = make(chan metaCacheEntry, 100)
+	objs := make(chan metaCacheEntry, 100)
 	w.streamErr = nil
 	w.streamWg.Add(1)
 	go func() {
@@ -185,6 +185,9 @@ func (w *metacacheWriter) stream() (chan<- metaCacheEntry, error) {
 				continue
 			}
 			err = w.mw.WriteBytes(o.metadata)
+			if w.reuseBlocks || o.reusable {
+				metaDataPoolPut(o.metadata)
+			}
 			if err != nil {
 				w.streamErr = err
 				continue
@@ -234,7 +237,7 @@ func (w *metacacheWriter) Reset(out io.Writer) {
 	}
 }
 
-var s2DecPool = sync.Pool{New: func() interface{} {
+var s2DecPool = bpool.Pool[*s2.Reader]{New: func() *s2.Reader {
 	// Default alloc block for network transfer.
 	return s2.NewReader(nil, s2.ReaderAllocBlock(16<<10))
 }}
@@ -251,14 +254,15 @@ type metacacheReader struct {
 // newMetacacheReader creates a new cache reader.
 // Nothing will be read from the stream yet.
 func newMetacacheReader(r io.Reader) *metacacheReader {
-	dec := s2DecPool.Get().(*s2.Reader)
+	dec := s2DecPool.Get()
 	dec.Reset(r)
-	mr := msgp.NewReader(dec)
+	mr := msgpNewReader(dec)
 	return &metacacheReader{
 		mr: mr,
 		closer: func() {
 			dec.Reset(nil)
 			s2DecPool.Put(dec)
+			readMsgpReaderPoolPut(mr)
 		},
 		creator: func() error {
 			v, err := mr.ReadByte()
@@ -407,7 +411,7 @@ func (r *metacacheReader) forwardTo(s string) error {
 		r.current.metadata = nil
 	}
 	// temporary name buffer.
-	var tmp = make([]byte, 0, 256)
+	tmp := make([]byte, 0, 256)
 	for {
 		if more, err := r.mr.ReadBool(); !more {
 			switch err {
@@ -458,7 +462,7 @@ func (r *metacacheReader) forwardTo(s string) error {
 // Will return io.EOF if end of stream is reached.
 // If requesting 0 objects nil error will always be returned regardless of at end of stream.
 // Use peek to determine if at end of stream.
-func (r *metacacheReader) readN(n int, inclDeleted, inclDirs bool, prefix string) (metaCacheEntriesSorted, error) {
+func (r *metacacheReader) readN(n int, inclDeleted, inclDirs, inclVersions bool, prefix string) (metaCacheEntriesSorted, error) {
 	r.checkInit()
 	if n == 0 {
 		return metaCacheEntriesSorted{}, nil
@@ -529,10 +533,10 @@ func (r *metacacheReader) readN(n int, inclDeleted, inclDirs bool, prefix string
 			metaDataPoolPut(meta.metadata)
 			meta.metadata = nil
 		}
-		if !inclDirs && meta.isDir() {
+		if !inclDirs && (meta.isDir() || (!inclVersions && meta.isObjectDir() && meta.isLatestDeletemarker())) {
 			continue
 		}
-		if !inclDeleted && meta.isLatestDeletemarker() {
+		if !inclDeleted && meta.isLatestDeletemarker() && meta.isObject() && !meta.isObjectDir() {
 			continue
 		}
 		res = append(res, meta)
@@ -547,7 +551,7 @@ func (r *metacacheReader) readAll(ctx context.Context, dst chan<- metaCacheEntry
 	if r.err != nil {
 		return r.err
 	}
-	defer close(dst)
+	defer xioutil.SafeClose(dst)
 	if r.current.name != "" {
 		select {
 		case <-ctx.Done():
@@ -560,8 +564,7 @@ func (r *metacacheReader) readAll(ctx context.Context, dst chan<- metaCacheEntry
 	}
 	for {
 		if more, err := r.mr.ReadBool(); !more {
-			switch err {
-			case io.EOF:
+			if err == io.EOF {
 				err = io.ErrUnexpectedEOF
 			}
 			r.err = err
@@ -755,7 +758,7 @@ func (r *metacacheReader) Close() error {
 	return nil
 }
 
-// metacacheBlockWriter collects blocks and provides a callaback to store them.
+// metacacheBlockWriter collects blocks and provides a callback to store them.
 type metacacheBlockWriter struct {
 	wg           sync.WaitGroup
 	streamErr    error
@@ -839,10 +842,10 @@ type metacacheBlock struct {
 }
 
 func (b metacacheBlock) headerKV() map[string]string {
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	v, err := json.Marshal(b)
 	if err != nil {
-		logger.LogIf(context.Background(), err) // Unlikely
+		bugLogIf(context.Background(), err) // Unlikely
 		return nil
 	}
 	return map[string]string{fmt.Sprintf("%s-metacache-part-%d", ReservedMetadataPrefixLower, b.n): string(v)}

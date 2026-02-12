@@ -23,38 +23,324 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/minio/minio/internal/bucket/lifecycle"
 )
 
-// Wrapper for calling ListObjects tests for both Erasure multiple disks and single node setup.
+func TestListObjectsVersionedFolders(t *testing.T) {
+	ExecObjectLayerTest(t, testListObjectsVersionedFolders)
+}
+
+func testListObjectsVersionedFolders(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
+	t, _ := t1.(*testing.T)
+	testBuckets := []string{
+		// This bucket is used for testing ListObject operations.
+		"test-bucket-folders",
+		// This bucket has file delete marker.
+		"test-bucket-files",
+	}
+	for _, bucket := range testBuckets {
+		err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{
+			VersioningEnabled: true,
+		})
+		if err != nil {
+			t.Fatalf("%s : %s", instanceType, err.Error())
+		}
+	}
+
+	var err error
+	testObjects := []struct {
+		parentBucket    string
+		name            string
+		content         string
+		meta            map[string]string
+		addDeleteMarker bool
+	}{
+		{testBuckets[0], "unique/folder/", "", nil, true},
+		{testBuckets[0], "unique/folder/1.txt", "content", nil, false},
+		{testBuckets[1], "unique/folder/1.txt", "content", nil, true},
+	}
+	for _, object := range testObjects {
+		md5Bytes := md5.Sum([]byte(object.content))
+		_, err = obj.PutObject(context.Background(), object.parentBucket, object.name, mustGetPutObjReader(t, bytes.NewBufferString(object.content),
+			int64(len(object.content)), hex.EncodeToString(md5Bytes[:]), ""), ObjectOptions{
+			Versioned:   globalBucketVersioningSys.PrefixEnabled(object.parentBucket, object.name),
+			UserDefined: object.meta,
+		})
+		if err != nil {
+			t.Fatalf("%s : %s", instanceType, err.Error())
+		}
+		if object.addDeleteMarker {
+			oi, err := obj.DeleteObject(context.Background(), object.parentBucket, object.name, ObjectOptions{
+				Versioned: globalBucketVersioningSys.PrefixEnabled(object.parentBucket, object.name),
+			})
+			if err != nil {
+				t.Fatalf("%s : %s", instanceType, err.Error())
+			}
+			if oi.DeleteMarker != object.addDeleteMarker {
+				t.Fatalf("Expected, marker %t : got %t", object.addDeleteMarker, oi.DeleteMarker)
+			}
+		}
+	}
+
+	// Formulating the result data set to be expected from ListObjects call inside the tests,
+	// This will be used in testCases and used for asserting the correctness of ListObjects output in the tests.
+
+	resultCases := []ListObjectsInfo{
+		{
+			IsTruncated: false,
+			Prefixes:    []string{"unique/folder/"},
+		},
+		{
+			IsTruncated: false,
+			Objects: []ObjectInfo{
+				{Name: "unique/folder/1.txt"},
+			},
+		},
+		{
+			IsTruncated: false,
+			Objects:     []ObjectInfo{},
+		},
+	}
+
+	resultCasesV := []ListObjectVersionsInfo{
+		{
+			IsTruncated: false,
+			Prefixes:    []string{"unique/folder/"},
+		},
+		{
+			IsTruncated: false,
+			Objects: []ObjectInfo{
+				{
+					Name:         "unique/folder/",
+					DeleteMarker: true,
+				},
+				{
+					Name:         "unique/folder/",
+					DeleteMarker: false,
+				},
+				{
+					Name:         "unique/folder/1.txt",
+					DeleteMarker: false,
+				},
+			},
+		},
+	}
+
+	testCases := []struct {
+		// Inputs to ListObjects.
+		bucketName string
+		prefix     string
+		marker     string
+		delimiter  string
+		maxKeys    int
+		versioned  bool
+		// Expected output of ListObjects.
+		resultL ListObjectsInfo
+		resultV ListObjectVersionsInfo
+		err     error
+		// Flag indicating whether the test is expected to pass or not.
+		shouldPass bool
+	}{
+		{testBuckets[0], "unique/", "", "/", 1000, false, resultCases[0], ListObjectVersionsInfo{}, nil, true},
+		{testBuckets[0], "unique/folder", "", "/", 1000, false, resultCases[0], ListObjectVersionsInfo{}, nil, true},
+		{testBuckets[0], "unique/", "", "", 1000, false, resultCases[1], ListObjectVersionsInfo{}, nil, true},
+		{testBuckets[1], "unique/", "", "/", 1000, false, resultCases[0], ListObjectVersionsInfo{}, nil, true},
+		{testBuckets[1], "unique/folder/", "", "/", 1000, false, resultCases[2], ListObjectVersionsInfo{}, nil, true},
+		{testBuckets[0], "unique/", "", "/", 1000, true, ListObjectsInfo{}, resultCasesV[0], nil, true},
+		{testBuckets[0], "unique/", "", "", 1000, true, ListObjectsInfo{}, resultCasesV[1], nil, true},
+	}
+
+	for i, testCase := range testCases {
+		t.Run(fmt.Sprintf("%s-Test%d", instanceType, i+1), func(t *testing.T) {
+			var err error
+			var resultL ListObjectsInfo
+			var resultV ListObjectVersionsInfo
+			if testCase.versioned {
+				t.Log("ListObjectVersions, bucket:", testCase.bucketName, "prefix:",
+					testCase.prefix, "marker:", testCase.marker, "delimiter:",
+					testCase.delimiter, "maxkeys:", testCase.maxKeys)
+
+				resultV, err = obj.ListObjectVersions(t.Context(), testCase.bucketName,
+					testCase.prefix, testCase.marker, "", testCase.delimiter, testCase.maxKeys)
+			} else {
+				t.Log("ListObjects, bucket:", testCase.bucketName, "prefix:",
+					testCase.prefix, "marker:", testCase.marker, "delimiter:",
+					testCase.delimiter, "maxkeys:", testCase.maxKeys)
+
+				resultL, err = obj.ListObjects(t.Context(), testCase.bucketName,
+					testCase.prefix, testCase.marker, testCase.delimiter, testCase.maxKeys)
+			}
+			if err != nil && testCase.shouldPass {
+				t.Errorf("Test %d: %s:  Expected to pass, but failed with: <ERROR> %s", i+1, instanceType, err.Error())
+			}
+			if err == nil && !testCase.shouldPass {
+				t.Errorf("Test %d: %s: Expected to fail with <ERROR> \"%s\", but passed instead", i+1, instanceType, testCase.err.Error())
+			}
+			// Failed as expected, but does it fail for the expected reason.
+			if err != nil && !testCase.shouldPass {
+				if !strings.Contains(err.Error(), testCase.err.Error()) {
+					t.Errorf("Test %d: %s: Expected to fail with error \"%s\", but instead failed with error \"%s\" instead", i+1, instanceType, testCase.err.Error(), err.Error())
+				}
+			}
+			// Since there are cases for which ListObjects fails, this is
+			// necessary. Test passes as expected, but the output values
+			// are verified for correctness here.
+			if err == nil && testCase.shouldPass {
+				// The length of the expected ListObjectsResult.Objects
+				// should match in both expected result from test cases
+				// and in the output. On failure calling t.Fatalf,
+				// otherwise it may lead to index out of range error in
+				// assertion following this.
+				if !testCase.versioned {
+					if len(testCase.resultL.Objects) != len(resultL.Objects) {
+						t.Logf("want: %v", objInfoNames(testCase.resultL.Objects))
+						t.Logf("got: %v", objInfoNames(resultL.Objects))
+						t.Errorf("Test %d: %s: Expected number of object in the result to be '%d', but found '%d' objects instead", i+1, instanceType, len(testCase.resultL.Objects), len(resultL.Objects))
+					}
+					for j := 0; j < len(testCase.resultL.Objects); j++ {
+						if j >= len(resultL.Objects) {
+							t.Errorf("Test %d: %s: Expected object name to be \"%s\", but not nothing instead", i+1, instanceType, testCase.resultL.Objects[j].Name)
+							continue
+						}
+						if testCase.resultL.Objects[j].Name != resultL.Objects[j].Name {
+							t.Errorf("Test %d: %s: Expected object name to be \"%s\", but found \"%s\" instead", i+1, instanceType, testCase.resultL.Objects[j].Name, resultL.Objects[j].Name)
+						}
+					}
+
+					if len(testCase.resultL.Prefixes) != len(resultL.Prefixes) {
+						t.Logf("want: %v", testCase.resultL.Prefixes)
+						t.Logf("got: %v", resultL.Prefixes)
+						t.Errorf("Test %d: %s: Expected number of prefixes in the result to be '%d', but found '%d' prefixes instead", i+1, instanceType, len(testCase.resultL.Prefixes), len(resultL.Prefixes))
+					}
+					for j := 0; j < len(testCase.resultL.Prefixes); j++ {
+						if j >= len(resultL.Prefixes) {
+							t.Errorf("Test %d: %s: Expected prefix name to be \"%s\", but found no result", i+1, instanceType, testCase.resultL.Prefixes[j])
+							continue
+						}
+						if testCase.resultL.Prefixes[j] != resultL.Prefixes[j] {
+							t.Errorf("Test %d: %s: Expected prefix name to be \"%s\", but found \"%s\" instead", i+1, instanceType, testCase.resultL.Prefixes[j], resultL.Prefixes[j])
+						}
+					}
+
+					if testCase.resultL.IsTruncated != resultL.IsTruncated {
+						// Allow an extra continuation token.
+						if !resultL.IsTruncated || len(resultL.Objects) == 0 {
+							t.Errorf("Test %d: %s: Expected IsTruncated flag to be %v, but instead found it to be %v", i+1, instanceType, testCase.resultL.IsTruncated, resultL.IsTruncated)
+						}
+					}
+
+					if testCase.resultL.IsTruncated && resultL.NextMarker == "" {
+						t.Errorf("Test %d: %s: Expected NextMarker to contain a string since listing is truncated, but instead found it to be empty", i+1, instanceType)
+					}
+
+					if !testCase.resultL.IsTruncated && resultL.NextMarker != "" {
+						if !resultL.IsTruncated || len(resultL.Objects) == 0 {
+							t.Errorf("Test %d: %s: Expected NextMarker to be empty since listing is not truncated, but instead found `%v`", i+1, instanceType, resultL.NextMarker)
+						}
+					}
+				} else {
+					if len(testCase.resultV.Objects) != len(resultV.Objects) {
+						t.Logf("want: %v", objInfoNames(testCase.resultV.Objects))
+						t.Logf("got: %v", objInfoNames(resultV.Objects))
+						t.Errorf("Test %d: %s: Expected number of object in the result to be '%d', but found '%d' objects instead", i+1, instanceType, len(testCase.resultV.Objects), len(resultV.Objects))
+					}
+					for j := 0; j < len(testCase.resultV.Objects); j++ {
+						if j >= len(resultV.Objects) {
+							t.Errorf("Test %d: %s: Expected object name to be \"%s\", but not nothing instead", i+1, instanceType, testCase.resultV.Objects[j].Name)
+							continue
+						}
+						if testCase.resultV.Objects[j].Name != resultV.Objects[j].Name {
+							t.Errorf("Test %d: %s: Expected object name to be \"%s\", but found \"%s\" instead", i+1, instanceType, testCase.resultV.Objects[j].Name, resultV.Objects[j].Name)
+						}
+					}
+
+					if len(testCase.resultV.Prefixes) != len(resultV.Prefixes) {
+						t.Logf("want: %v", testCase.resultV.Prefixes)
+						t.Logf("got: %v", resultV.Prefixes)
+						t.Errorf("Test %d: %s: Expected number of prefixes in the result to be '%d', but found '%d' prefixes instead", i+1, instanceType, len(testCase.resultV.Prefixes), len(resultV.Prefixes))
+					}
+					for j := 0; j < len(testCase.resultV.Prefixes); j++ {
+						if j >= len(resultV.Prefixes) {
+							t.Errorf("Test %d: %s: Expected prefix name to be \"%s\", but found no result", i+1, instanceType, testCase.resultV.Prefixes[j])
+							continue
+						}
+						if testCase.resultV.Prefixes[j] != resultV.Prefixes[j] {
+							t.Errorf("Test %d: %s: Expected prefix name to be \"%s\", but found \"%s\" instead", i+1, instanceType, testCase.resultV.Prefixes[j], resultV.Prefixes[j])
+						}
+					}
+
+					if testCase.resultV.IsTruncated != resultV.IsTruncated {
+						// Allow an extra continuation token.
+						if !resultV.IsTruncated || len(resultV.Objects) == 0 {
+							t.Errorf("Test %d: %s: Expected IsTruncated flag to be %v, but instead found it to be %v", i+1, instanceType, testCase.resultV.IsTruncated, resultV.IsTruncated)
+						}
+					}
+
+					if testCase.resultV.IsTruncated && resultV.NextMarker == "" {
+						t.Errorf("Test %d: %s: Expected NextMarker to contain a string since listing is truncated, but instead found it to be empty", i+1, instanceType)
+					}
+
+					if !testCase.resultV.IsTruncated && resultV.NextMarker != "" {
+						if !resultV.IsTruncated || len(resultV.Objects) == 0 {
+							t.Errorf("Test %d: %s: Expected NextMarker to be empty since listing is not truncated, but instead found `%v`", i+1, instanceType, resultV.NextMarker)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+// Wrapper for calling ListObjectsOnVersionedBuckets tests for both
+// Erasure multiple disks and single node setup.
+func TestListObjectsOnVersionedBuckets(t *testing.T) {
+	ExecObjectLayerTest(t, testListObjectsOnVersionedBuckets)
+}
+
+// Wrapper for calling ListObjects tests for both Erasure multiple
+// disks and single node setup.
 func TestListObjects(t *testing.T) {
 	ExecObjectLayerTest(t, testListObjects)
 }
 
-// Unit test for ListObjects in general.
+// Unit test for ListObjects on VersionedBucket.
+func testListObjectsOnVersionedBuckets(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
+	_testListObjects(obj, instanceType, t1, true)
+}
+
+// Unit test for ListObjects.
 func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
+	_testListObjects(obj, instanceType, t1, false)
+}
+
+func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, versioned bool) {
 	t, _ := t1.(*testing.T)
 	testBuckets := []string{
 		// This bucket is used for testing ListObject operations.
-		"test-bucket-list-object",
+		0: "test-bucket-list-object",
 		// This bucket will be tested with empty directories
-		"test-bucket-empty-dir",
+		1: "test-bucket-empty-dir",
 		// Will not store any objects in this bucket,
 		// Its to test ListObjects on an empty bucket.
-		"empty-bucket",
+		2: "empty-bucket",
 		// Listing the case where the marker > last object.
-		"test-bucket-single-object",
+		3: "test-bucket-single-object",
 		// Listing uncommon delimiter.
-		"test-bucket-delimiter",
+		4: "test-bucket-delimiter",
 		// Listing prefixes > maxKeys
-		"test-bucket-max-keys-prefixes",
+		5: "test-bucket-max-keys-prefixes",
+		// Listing custom delimiters
+		6: "test-bucket-custom-delimiter",
 	}
 	for _, bucket := range testBuckets {
-		err := obj.MakeBucketWithLocation(context.Background(), bucket, BucketOptions{})
+		err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{
+			VersioningEnabled: versioned,
+		})
 		if err != nil {
 			t.Fatalf("%s : %s", instanceType, err.Error())
 		}
@@ -89,24 +375,31 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		{testBuckets[5], "foo/201910/2112", "content", nil},
 		{testBuckets[5], "foo/201910_txt", "content", nil},
 		{testBuckets[5], "201910/foo/bar/xl.meta/1.txt", "content", nil},
+		{testBuckets[6], "aaa", "content", nil},
+		{testBuckets[6], "bbb_aaa", "content", nil},
+		{testBuckets[6], "bbb_aaa", "content", nil},
+		{testBuckets[6], "ccc", "content", nil},
 	}
 	for _, object := range testObjects {
 		md5Bytes := md5.Sum([]byte(object.content))
-		_, err = obj.PutObject(context.Background(), object.parentBucket, object.name, mustGetPutObjReader(t, bytes.NewBufferString(object.content),
-			int64(len(object.content)), hex.EncodeToString(md5Bytes[:]), ""), ObjectOptions{UserDefined: object.meta})
+		_, err = obj.PutObject(context.Background(), object.parentBucket, object.name,
+			mustGetPutObjReader(t, bytes.NewBufferString(object.content),
+				int64(len(object.content)), hex.EncodeToString(md5Bytes[:]), ""), ObjectOptions{
+				Versioned:   globalBucketVersioningSys.PrefixEnabled(object.parentBucket, object.name),
+				UserDefined: object.meta,
+			})
 		if err != nil {
 			t.Fatalf("%s : %s", instanceType, err.Error())
 		}
-
 	}
 
-	// Formualting the result data set to be expected from ListObjects call inside the tests,
+	// Formulating the result data set to be expected from ListObjects call inside the tests,
 	// This will be used in testCases and used for asserting the correctness of ListObjects output in the tests.
 
 	resultCases := []ListObjectsInfo{
 		// ListObjectsResult-0.
 		// Testing for listing all objects in the bucket, (testCase 20,21,22).
-		{
+		0: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "Asia-maps.png"},
@@ -122,7 +415,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-1.
 		// Used for asserting the truncated case, (testCase 23).
-		{
+		1: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "Asia-maps.png"},
@@ -134,7 +427,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-2.
 		// (TestCase 24).
-		{
+		2: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "Asia-maps.png"},
@@ -145,7 +438,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-3.
 		// (TestCase 25).
-		{
+		3: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "Asia-maps.png"},
@@ -156,7 +449,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		// ListObjectsResult-4.
 		// Again used for truncated case.
 		// (TestCase 26).
-		{
+		4: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "Asia-maps.png"},
@@ -165,7 +458,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		// ListObjectsResult-5.
 		// Used for Asserting prefixes.
 		// Used for test case with prefix "new", (testCase 27-29).
-		{
+		5: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix0"},
@@ -176,7 +469,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		// ListObjectsResult-6.
 		// Used for Asserting prefixes.
 		// Used for test case with prefix = "obj", (testCase 30).
-		{
+		6: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "obj0"},
@@ -187,7 +480,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		// ListObjectsResult-7.
 		// Used for Asserting prefixes and truncation.
 		// Used for test case with prefix = "new" and maxKeys = 1, (testCase 31).
-		{
+		7: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix0"},
@@ -196,7 +489,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		// ListObjectsResult-8.
 		// Used for Asserting prefixes.
 		// Used for test case with prefix = "obj" and maxKeys = 2, (testCase 32).
-		{
+		8: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "obj0"},
@@ -205,8 +498,8 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-9.
 		// Used for asserting the case with marker, but without prefix.
-		//marker is set to "newPrefix0" in the testCase, (testCase 33).
-		{
+		// marker is set to "newPrefix0" in the testCase, (testCase 33).
+		9: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix1"},
@@ -217,8 +510,8 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 			},
 		},
 		// ListObjectsResult-10.
-		//marker is set to "newPrefix1" in the testCase, (testCase 34).
-		{
+		// marker is set to "newPrefix1" in the testCase, (testCase 34).
+		10: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newzen/zen/recurse/again/again/again/pics"},
@@ -228,8 +521,8 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 			},
 		},
 		// ListObjectsResult-11.
-		//marker is set to "obj0" in the testCase, (testCase 35).
-		{
+		// marker is set to "obj0" in the testCase, (testCase 35).
+		11: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "obj1"},
@@ -238,7 +531,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-12.
 		// Marker is set to "obj1" in the testCase, (testCase 36).
-		{
+		12: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "obj2"},
@@ -246,7 +539,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-13.
 		// Marker is set to "man" in the testCase, (testCase37).
-		{
+		13: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix0"},
@@ -259,7 +552,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-14.
 		// Marker is set to "Abc" in the testCase, (testCase 39).
-		{
+		14: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "Asia-maps.png"},
@@ -275,7 +568,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-15.
 		// Marker is set to "Asia/India/India-summer-photos-1" in the testCase, (testCase 40).
-		{
+		15: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "Asia/India/Karnataka/Bangalore/Koramangala/pics"},
@@ -289,7 +582,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-16.
 		// Marker is set to "Asia/India/Karnataka/Bangalore/Koramangala/pics" in the testCase, (testCase 41).
-		{
+		16: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix0"},
@@ -304,7 +597,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		// Used for asserting the case with marker, without prefix but with truncation.
 		// Marker =  "newPrefix0" & maxKeys = 3 in the testCase, (testCase42).
 		// Output truncated to 3 values.
-		{
+		17: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix1"},
@@ -315,7 +608,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		// ListObjectsResult-18.
 		// Marker = "newPrefix1" & maxkeys = 1 in the testCase, (testCase43).
 		// Output truncated to 1 value.
-		{
+		18: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "newzen/zen/recurse/again/again/again/pics"},
@@ -324,7 +617,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		// ListObjectsResult-19.
 		// Marker = "obj0" & maxKeys = 1 in the testCase, (testCase44).
 		// Output truncated to 1 value.
-		{
+		19: {
 			IsTruncated: true,
 			Objects: []ObjectInfo{
 				{Name: "obj1"},
@@ -332,7 +625,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-20.
 		// Marker = "obj0" & prefix = "obj" in the testCase, (testCase 45).
-		{
+		20: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "obj1"},
@@ -341,7 +634,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-21.
 		// Marker = "obj1" & prefix = "obj" in the testCase, (testCase 46).
-		{
+		21: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "obj2"},
@@ -349,7 +642,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-22.
 		// Marker = "newPrefix0" & prefix = "new" in the testCase,, (testCase 47).
-		{
+		22: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix1"},
@@ -358,7 +651,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-23.
 		// Prefix is set to "Asia/India/" in the testCase, and delimiter is not set (testCase 55).
-		{
+		23: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "Asia/India/India-summer-photos-1"},
@@ -368,7 +661,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 
 		// ListObjectsResult-24.
 		// Prefix is set to "Asia" in the testCase, and delimiter is not set (testCase 56).
-		{
+		24: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "Asia-maps.png"},
@@ -379,7 +672,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 
 		// ListObjectsResult-25.
 		// Prefix is set to "Asia" in the testCase, and delimiter is set (testCase 57).
-		{
+		25: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "Asia-maps.png"},
@@ -388,7 +681,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-26.
 		// prefix = "new" and delimiter is set in the testCase.(testCase 58).
-		{
+		26: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix0"},
@@ -398,7 +691,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-27.
 		// Prefix is set to "Asia/India/" in the testCase, and delimiter is set to forward slash '/' (testCase 59).
-		{
+		27: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "Asia/India/India-summer-photos-1"},
@@ -407,7 +700,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-28.
 		// Marker is set to "Asia/India/India-summer-photos-1" and delimiter set in the testCase, (testCase 60).
-		{
+		28: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix0"},
@@ -420,7 +713,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-29.
 		// Marker is set to "Asia/India/Karnataka/Bangalore/Koramangala/pics" in the testCase and delimiter set, (testCase 61).
-		{
+		29: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "newPrefix0"},
@@ -433,12 +726,12 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		},
 		// ListObjectsResult-30.
 		// Prefix and Delimiter is set to '/', (testCase 62).
-		{
+		30: {
 			IsTruncated: false,
 			Objects:     []ObjectInfo{},
 		},
 		// ListObjectsResult-31 Empty directory, recursive listing
-		{
+		31: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "obj1"},
@@ -447,7 +740,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 			},
 		},
 		// ListObjectsResult-32 Empty directory, non recursive listing
-		{
+		32: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "obj1"},
@@ -456,7 +749,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 			Prefixes: []string{"temporary/"},
 		},
 		// ListObjectsResult-33 Listing empty directory only
-		{
+		33: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "temporary/0/"},
@@ -465,12 +758,12 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		// ListObjectsResult-34:
 		//    * Listing with marker > last object should return empty
 		//    * Listing an object with a trailing slash and '/' delimiter
-		{
+		34: {
 			IsTruncated: false,
 			Objects:     []ObjectInfo{},
 		},
 		// ListObjectsResult-35 list with custom uncommon delimiter
-		{
+		35: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "file1/receipt.json"},
@@ -478,12 +771,12 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 			Prefixes: []string{"file1/guidSplunk"},
 		},
 		// ListObjectsResult-36 list with nextmarker prefix and maxKeys set to 1.
-		{
+		36: {
 			IsTruncated: true,
 			Prefixes:    []string{"dir/day_id=2017-10-10/"},
 		},
 		// ListObjectsResult-37 list with prefix match 2 levels deep
-		{
+		37: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "foo/201910/1112"},
@@ -491,7 +784,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 			},
 		},
 		// ListObjectsResult-38 list with prefix match 1 level deep
-		{
+		38: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "foo/201910/1112"},
@@ -501,11 +794,20 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 			},
 		},
 		// ListObjectsResult-39 list with prefix match 1 level deep
-		{
+		39: {
 			IsTruncated: false,
 			Objects: []ObjectInfo{
 				{Name: "201910/foo/bar/xl.meta/1.txt"},
 			},
+		},
+		// ListObjectsResult-40
+		40: {
+			IsTruncated: false,
+			Objects: []ObjectInfo{
+				{Name: "aaa"},
+				{Name: "ccc"},
+			},
+			Prefixes: []string{"bbb_"},
 		},
 	}
 
@@ -523,19 +825,18 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		shouldPass bool
 	}{
 		// Test cases with invalid bucket names ( Test number 1-4 ).
-		{".test", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: ".test"}, false},
-		{"Test", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "Test"}, false},
-		{"---", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "---"}, false},
-		{"ad", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "ad"}, false},
-		// Using an existing file for bucket name, but its not a directory (5).
-		{"simple-file.txt", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "simple-file.txt"}, false},
-		// Valid bucket names, but they donot exist (6-8).
-		{"volatile-bucket-1", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-1"}, false},
-		{"volatile-bucket-2", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-2"}, false},
-		{"volatile-bucket-3", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-3"}, false},
-		// Testing for failure cases with both perfix and marker (11).
-		// The prefix and marker combination to be valid it should satisfy strings.HasPrefix(marker, prefix).
-		{"test-bucket-list-object", "asia", "europe-object", "", 0, ListObjectsInfo{}, fmt.Errorf("Invalid combination of marker '%s' and prefix '%s'", "europe-object", "asia"), false},
+		{".test", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: ".test"}, false},
+		{"Test", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "Test"}, false},
+		{"---", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "---"}, false},
+		{"ad", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "ad"}, false},
+		// Valid bucket names, but they do not exist (6-8).
+		{"volatile-bucket-1", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-1"}, false},
+		{"volatile-bucket-2", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-2"}, false},
+		{"volatile-bucket-3", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-3"}, false},
+		// If marker is *after* the last possible object from the prefix it should return an empty list.
+		{"test-bucket-list-object", "Asia", "europe-object", "", 0, ListObjectsInfo{}, nil, true},
+		// If the marker is *before* the first possible object from the prefix it should return the first object.
+		{"test-bucket-list-object", "Asia", "A", "", 1, resultCases[4], nil, true},
 		// Setting a non-existing directory to be prefix (12-13).
 		{"empty-bucket", "europe/france/", "", "", 1, ListObjectsInfo{}, nil, true},
 		{"empty-bucket", "africa/tunisia/", "", "", 1, ListObjectsInfo{}, nil, true},
@@ -548,11 +849,11 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		{"empty-bucket", "", "", "", 111100000, ListObjectsInfo{}, nil, true},
 		// Testing for all 10 objects in the bucket (18).
 		{"test-bucket-list-object", "", "", "", 10, resultCases[0], nil, true},
-		//Testing for negative value of maxKey, this should set maxKeys to listObjectsLimit (19).
+		// Testing for negative value of maxKey, this should set maxKeys to listObjectsLimit (19).
 		{"test-bucket-list-object", "", "", "", -1, resultCases[0], nil, true},
 		// Testing for very large value of maxKey, this should set maxKeys to listObjectsLimit (20).
 		{"test-bucket-list-object", "", "", "", 1234567890, resultCases[0], nil, true},
-		// Testing for trancated value (21-24).
+		// Testing for truncated value (21-24).
 		{"test-bucket-list-object", "", "", "", 5, resultCases[1], nil, true},
 		{"test-bucket-list-object", "", "", "", 4, resultCases[2], nil, true},
 		{"test-bucket-list-object", "", "", "", 3, resultCases[3], nil, true},
@@ -578,7 +879,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		// Marker being set to a value which is lesser than and all object names when sorted (37).
 		// Expected to send all the objects in the bucket in this case.
 		{"test-bucket-list-object", "", "Abc", "", 10, resultCases[14], nil, true},
-		// Marker is to a hierarhical value (38-39).
+		// Marker is to a hierarchical value (38-39).
 		{"test-bucket-list-object", "", "Asia/India/India-summer-photos-1", "", 10, resultCases[15], nil, true},
 		{"test-bucket-list-object", "", "Asia/India/Karnataka/Bangalore/Koramangala/pics", "", 10, resultCases[16], nil, true},
 		// Testing with marker and truncation, but no prefix (40-42).
@@ -609,7 +910,7 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		{"test-bucket-list-object", "Asia", "", SlashSeparator, 10, resultCases[25], nil, true},
 		{"test-bucket-list-object", "new", "", SlashSeparator, 10, resultCases[26], nil, true},
 		{"test-bucket-list-object", "Asia/India/", "", SlashSeparator, 10, resultCases[27], nil, true},
-		// Test with marker set as hierarhical value and with delimiter. (58-59)
+		// Test with marker set as hierarchical value and with delimiter. (58-59)
 		{"test-bucket-list-object", "", "Asia/India/India-summer-photos-1", SlashSeparator, 10, resultCases[28], nil, true},
 		{"test-bucket-list-object", "", "Asia/India/Karnataka/Bangalore/Koramangala/pics", SlashSeparator, 10, resultCases[29], nil, true},
 		// Test with prefix and delimiter set to '/'. (60)
@@ -637,13 +938,14 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 		{testBuckets[5], "foo/201910", "", "", 1000, resultCases[38], nil, true},
 		// Test listing with prefix match with 'xl.meta'
 		{testBuckets[5], "201910/foo/bar", "", "", 1000, resultCases[39], nil, true},
+		// Test listing with custom prefix
+		{testBuckets[6], "", "", "_", 1000, resultCases[40], nil, true},
 	}
 
 	for i, testCase := range testCases {
-		testCase := testCase
 		t.Run(fmt.Sprintf("%s-Test%d", instanceType, i+1), func(t *testing.T) {
 			t.Log("ListObjects, bucket:", testCase.bucketName, "prefix:", testCase.prefix, "marker:", testCase.marker, "delimiter:", testCase.delimiter, "maxkeys:", testCase.maxKeys)
-			result, err := obj.ListObjects(context.Background(), testCase.bucketName,
+			result, err := obj.ListObjects(t.Context(), testCase.bucketName,
 				testCase.prefix, testCase.marker, testCase.delimiter, int(testCase.maxKeys))
 			if err != nil && testCase.shouldPass {
 				t.Errorf("Test %d: %s:  Expected to pass, but failed with: <ERROR> %s", i+1, instanceType, err.Error())
@@ -712,18 +1014,92 @@ func testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
 						t.Errorf("Test %d: %s: Expected NextMarker to be empty since listing is not truncated, but instead found `%v`", i+1, instanceType, result.NextMarker)
 					}
 				}
-
 			}
 		})
 	}
 }
 
 func objInfoNames(o []ObjectInfo) []string {
-	var res = make([]string, len(o))
+	res := make([]string, len(o))
 	for i := range o {
 		res[i] = o[i].Name
 	}
 	return res
+}
+
+func TestDeleteObjectVersionMarker(t *testing.T) {
+	ExecObjectLayerTest(t, testDeleteObjectVersion)
+}
+
+func testDeleteObjectVersion(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
+	t, _ := t1.(*testing.T)
+
+	testBuckets := []string{
+		"bucket-suspended-version",
+		"bucket-suspended-version-id",
+	}
+	for _, bucket := range testBuckets {
+		err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{
+			VersioningEnabled: true,
+		})
+		if err != nil {
+			t.Fatalf("%s : %s", instanceType, err)
+		}
+		meta, err := loadBucketMetadata(context.Background(), obj, bucket)
+		if err != nil {
+			t.Fatalf("%s : %s", instanceType, err)
+		}
+		meta.VersioningConfigXML = []byte(`<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Suspended</Status></VersioningConfiguration>`)
+		if err := meta.Save(context.Background(), obj); err != nil {
+			t.Fatalf("%s : %s", instanceType, err)
+		}
+		globalBucketMetadataSys.Set(bucket, meta)
+		globalNotificationSys.LoadBucketMetadata(context.Background(), bucket)
+	}
+
+	testObjects := []struct {
+		parentBucket    string
+		name            string
+		content         string
+		meta            map[string]string
+		versionID       string
+		expectDelMarker bool
+	}{
+		{testBuckets[0], "delete-file", "contentstring", nil, "", true},
+		{testBuckets[1], "delete-file", "contentstring", nil, "null", false},
+	}
+	for _, object := range testObjects {
+		md5Bytes := md5.Sum([]byte(object.content))
+		_, err := obj.PutObject(context.Background(), object.parentBucket, object.name,
+			mustGetPutObjReader(t, bytes.NewBufferString(object.content),
+				int64(len(object.content)), hex.EncodeToString(md5Bytes[:]), ""), ObjectOptions{
+				Versioned:        globalBucketVersioningSys.PrefixEnabled(object.parentBucket, object.name),
+				VersionSuspended: globalBucketVersioningSys.PrefixSuspended(object.parentBucket, object.name),
+				UserDefined:      object.meta,
+			})
+		if err != nil {
+			t.Fatalf("%s : %s", instanceType, err)
+		}
+		obj, err := obj.DeleteObject(context.Background(), object.parentBucket, object.name, ObjectOptions{
+			Versioned:        globalBucketVersioningSys.PrefixEnabled(object.parentBucket, object.name),
+			VersionSuspended: globalBucketVersioningSys.PrefixSuspended(object.parentBucket, object.name),
+			VersionID:        object.versionID,
+		})
+		if err != nil {
+			if object.versionID != "" {
+				if !isErrVersionNotFound(err) {
+					t.Fatalf("%s : %s", instanceType, err)
+				}
+			} else {
+				if !isErrObjectNotFound(err) {
+					t.Fatalf("%s : %s", instanceType, err)
+				}
+			}
+		}
+		if obj.DeleteMarker != object.expectDelMarker {
+			t.Fatalf("%s : expected deleted marker %t, found %t", instanceType, object.expectDelMarker, obj.DeleteMarker)
+		}
+	}
 }
 
 // Wrapper for calling ListObjectVersions tests for both Erasure multiple disks and single node setup.
@@ -750,12 +1126,8 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 		"test-bucket-max-keys-prefixes",
 	}
 	for _, bucket := range testBuckets {
-		err := obj.MakeBucketWithLocation(context.Background(), bucket, BucketOptions{VersioningEnabled: true})
+		err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{VersioningEnabled: true})
 		if err != nil {
-			if _, ok := err.(NotImplemented); ok {
-				// Skip test for FS mode.
-				continue
-			}
 			t.Fatalf("%s : %s", instanceType, err.Error())
 		}
 	}
@@ -791,16 +1163,11 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 		_, err = obj.PutObject(context.Background(), object.parentBucket, object.name, mustGetPutObjReader(t, bytes.NewBufferString(object.content),
 			int64(len(object.content)), hex.EncodeToString(md5Bytes[:]), ""), ObjectOptions{UserDefined: object.meta})
 		if err != nil {
-			if _, ok := err.(BucketNotFound); ok {
-				// Skip test failure for FS mode.
-				continue
-			}
 			t.Fatalf("%s : %s", instanceType, err.Error())
 		}
-
 	}
 
-	// Formualting the result data set to be expected from ListObjects call inside the tests,
+	// Formulating the result data set to be expected from ListObjects call inside the tests,
 	// This will be used in testCases and used for asserting the correctness of ListObjects output in the tests.
 
 	resultCases := []ListObjectsInfo{
@@ -905,7 +1272,7 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 		},
 		// ListObjectsResult-9.
 		// Used for asserting the case with marker, but without prefix.
-		//marker is set to "newPrefix0" in the testCase, (testCase 33).
+		// marker is set to "newPrefix0" in the testCase, (testCase 33).
 		{
 			IsTruncated: false,
 			Objects: []ObjectInfo{
@@ -917,7 +1284,7 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 			},
 		},
 		// ListObjectsResult-10.
-		//marker is set to "newPrefix1" in the testCase, (testCase 34).
+		// marker is set to "newPrefix1" in the testCase, (testCase 34).
 		{
 			IsTruncated: false,
 			Objects: []ObjectInfo{
@@ -928,7 +1295,7 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 			},
 		},
 		// ListObjectsResult-11.
-		//marker is set to "obj0" in the testCase, (testCase 35).
+		// marker is set to "obj0" in the testCase, (testCase 35).
 		{
 			IsTruncated: false,
 			Objects: []ObjectInfo{
@@ -1198,19 +1565,16 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 		shouldPass bool
 	}{
 		// Test cases with invalid bucket names ( Test number 1-4).
-		{".test", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: ".test"}, false},
-		{"Test", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "Test"}, false},
-		{"---", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "---"}, false},
-		{"ad", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "ad"}, false},
-		// Using an existing file for bucket name, but its not a directory (5).
-		{"simple-file.txt", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "simple-file.txt"}, false},
-		// Valid bucket names, but they donot exist (6-8).
-		{"volatile-bucket-1", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-1"}, false},
-		{"volatile-bucket-2", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-2"}, false},
-		{"volatile-bucket-3", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-3"}, false},
-		// Testing for failure cases with both perfix and marker (9).
-		// The prefix and marker combination to be valid it should satisfy strings.HasPrefix(marker, prefix).
-		{"test-bucket-list-object", "asia", "europe-object", "", 0, ListObjectsInfo{}, fmt.Errorf("Invalid combination of marker '%s' and prefix '%s'", "europe-object", "asia"), false},
+		{".test", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: ".test"}, false},
+		{"Test", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "Test"}, false},
+		{"---", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "---"}, false},
+		{"ad", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "ad"}, false},
+		// Valid bucket names, but they do not exist (6-8).
+		{"volatile-bucket-1", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-1"}, false},
+		{"volatile-bucket-2", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-2"}, false},
+		{"volatile-bucket-3", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-3"}, false},
+		// If marker is *after* the last possible object from the prefix it should return an empty list.
+		{"test-bucket-list-object", "Asia", "europe-object", "", 0, ListObjectsInfo{}, nil, true},
 		// Setting a non-existing directory to be prefix (10-11).
 		{"empty-bucket", "europe/france/", "", "", 1, ListObjectsInfo{}, nil, true},
 		{"empty-bucket", "africa/tunisia/", "", "", 1, ListObjectsInfo{}, nil, true},
@@ -1223,11 +1587,11 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 		{"empty-bucket", "", "", "", 111100000, ListObjectsInfo{}, nil, true},
 		// Testing for all 10 objects in the bucket (16).
 		{"test-bucket-list-object", "", "", "", 10, resultCases[0], nil, true},
-		//Testing for negative value of maxKey, this should set maxKeys to listObjectsLimit (17).
+		// Testing for negative value of maxKey, this should set maxKeys to listObjectsLimit (17).
 		{"test-bucket-list-object", "", "", "", -1, resultCases[0], nil, true},
 		// Testing for very large value of maxKey, this should set maxKeys to listObjectsLimit (18).
 		{"test-bucket-list-object", "", "", "", 1234567890, resultCases[0], nil, true},
-		// Testing for trancated value (19-22).
+		// Testing for truncated value (19-22).
 		{"test-bucket-list-object", "", "", "", 5, resultCases[1], nil, true},
 		{"test-bucket-list-object", "", "", "", 4, resultCases[2], nil, true},
 		{"test-bucket-list-object", "", "", "", 3, resultCases[3], nil, true},
@@ -1252,7 +1616,7 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 		// Marker being set to a value which is lesser than and all object names when sorted (35).
 		// Expected to send all the objects in the bucket in this case.
 		{"test-bucket-list-object", "", "Abc", "", 10, resultCases[14], nil, true},
-		// Marker is to a hierarhical value (36-37).
+		// Marker is to a hierarchical value (36-37).
 		{"test-bucket-list-object", "", "Asia/India/India-summer-photos-1", "", 10, resultCases[15], nil, true},
 		{"test-bucket-list-object", "", "Asia/India/Karnataka/Bangalore/Koramangala/pics", "", 10, resultCases[16], nil, true},
 		// Testing with marker and truncation, but no prefix (38-40).
@@ -1283,7 +1647,7 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 		{"test-bucket-list-object", "Asia", "", SlashSeparator, 10, resultCases[25], nil, true},
 		{"test-bucket-list-object", "new", "", SlashSeparator, 10, resultCases[26], nil, true},
 		{"test-bucket-list-object", "Asia/India/", "", SlashSeparator, 10, resultCases[27], nil, true},
-		// Test with marker set as hierarhical value and with delimiter. (56-57)
+		// Test with marker set as hierarchical value and with delimiter. (56-57)
 		{"test-bucket-list-object", "", "Asia/India/India-summer-photos-1", SlashSeparator, 10, resultCases[28], nil, true},
 		{"test-bucket-list-object", "", "Asia/India/Karnataka/Bangalore/Koramangala/pics", SlashSeparator, 10, resultCases[29], nil, true},
 		// Test with prefix and delimiter set to '/'. (58)
@@ -1306,17 +1670,13 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 		{testBuckets[4], "file1/", "", "guidSplunk", 1000, resultCases[35], nil, true},
 		// Test listing at prefix with expected prefix markers
 		{testBuckets[5], "dir/", "", SlashSeparator, 1, resultCases[36], nil, true},
+		{"test-bucket-list-object", "Asia", "A", "", 1, resultCases[4], nil, true},
 	}
 
 	for i, testCase := range testCases {
-		testCase := testCase
 		t.Run(fmt.Sprintf("%s-Test%d", instanceType, i+1), func(t *testing.T) {
-			result, err := obj.ListObjectVersions(context.Background(), testCase.bucketName,
+			result, err := obj.ListObjectVersions(t.Context(), testCase.bucketName,
 				testCase.prefix, testCase.marker, "", testCase.delimiter, int(testCase.maxKeys))
-			if _, ok := err.(NotImplemented); ok {
-				// Not implemented should be skipped
-				t.Skip()
-			}
 			if err != nil && testCase.shouldPass {
 				t.Errorf("%s:  Expected to pass, but failed with: <ERROR> %s", instanceType, err.Error())
 			}
@@ -1378,51 +1738,309 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 	}
 }
 
+// Wrapper for calling ListObjects continuation tests for both Erasure multiple disks and single node setup.
+func TestListObjectsContinuation(t *testing.T) {
+	ExecObjectLayerTest(t, testListObjectsContinuation)
+}
+
+// Unit test for ListObjects in general.
+func testListObjectsContinuation(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
+	t, _ := t1.(*testing.T)
+	testBuckets := []string{
+		// This bucket is used for testing ListObject operations.
+		"test-bucket-list-object-continuation-1",
+		"test-bucket-list-object-continuation-2",
+	}
+	for _, bucket := range testBuckets {
+		err := obj.MakeBucket(context.Background(), bucket, MakeBucketOptions{})
+		if err != nil {
+			t.Fatalf("%s : %s", instanceType, err.Error())
+		}
+	}
+
+	var err error
+	testObjects := []struct {
+		parentBucket string
+		name         string
+		content      string
+		meta         map[string]string
+	}{
+		{testBuckets[0], "a/1.txt", "contentstring", nil},
+		{testBuckets[0], "a-1.txt", "contentstring", nil},
+		{testBuckets[0], "a.txt", "contentstring", nil},
+		{testBuckets[0], "apache2-doc/1.txt", "contentstring", nil},
+		{testBuckets[0], "apache2/1.txt", "contentstring", nil},
+		{testBuckets[0], "apache2/-sub/2.txt", "contentstring", nil},
+		{testBuckets[1], "azerty/1.txt", "contentstring", nil},
+		{testBuckets[1], "apache2-doc/1.txt", "contentstring", nil},
+		{testBuckets[1], "apache2/1.txt", "contentstring", nil},
+	}
+	for _, object := range testObjects {
+		md5Bytes := md5.Sum([]byte(object.content))
+		_, err = obj.PutObject(context.Background(), object.parentBucket, object.name, mustGetPutObjReader(t, bytes.NewBufferString(object.content),
+			int64(len(object.content)), hex.EncodeToString(md5Bytes[:]), ""), ObjectOptions{UserDefined: object.meta})
+		if err != nil {
+			t.Fatalf("%s : %s", instanceType, err.Error())
+		}
+	}
+
+	// Formulating the result data set to be expected from ListObjects call inside the tests,
+	// This will be used in testCases and used for asserting the correctness of ListObjects output in the tests.
+	resultCases := []ListObjectsInfo{
+		{
+			Objects: []ObjectInfo{
+				{Name: "a-1.txt"},
+				{Name: "a.txt"},
+				{Name: "a/1.txt"},
+				{Name: "apache2-doc/1.txt"},
+				{Name: "apache2/-sub/2.txt"},
+				{Name: "apache2/1.txt"},
+			},
+		},
+		{
+			Objects: []ObjectInfo{
+				{Name: "apache2-doc/1.txt"},
+				{Name: "apache2/1.txt"},
+			},
+		},
+		{
+			Prefixes: []string{"apache2-doc/", "apache2/", "azerty/"},
+		},
+	}
+
+	testCases := []struct {
+		// Inputs to ListObjects.
+		bucketName string
+		prefix     string
+		delimiter  string
+		page       int
+		// Expected output of ListObjects.
+		result ListObjectsInfo
+	}{
+		{testBuckets[0], "", "", 1, resultCases[0]},
+		{testBuckets[0], "a", "", 1, resultCases[0]},
+		{testBuckets[1], "apache", "", 1, resultCases[1]},
+		{testBuckets[1], "", "/", 1, resultCases[2]},
+	}
+
+	for i, testCase := range testCases {
+		t.Run(fmt.Sprintf("%s-Test%d", instanceType, i+1), func(t *testing.T) {
+			var foundObjects []ObjectInfo
+			var foundPrefixes []string
+			marker := ""
+			for {
+				result, err := obj.ListObjects(t.Context(), testCase.bucketName,
+					testCase.prefix, marker, testCase.delimiter, testCase.page)
+				if err != nil {
+					t.Fatalf("Test %d: %s: Expected to pass, but failed with: <ERROR> %s", i+1, instanceType, err.Error())
+				}
+				foundObjects = append(foundObjects, result.Objects...)
+				foundPrefixes = append(foundPrefixes, result.Prefixes...)
+				if !result.IsTruncated {
+					break
+				}
+				marker = result.NextMarker
+				if len(result.Objects) > 0 {
+					// Discard marker, so it cannot resume listing.
+					marker = result.Objects[len(result.Objects)-1].Name
+				}
+			}
+
+			if len(testCase.result.Objects) != len(foundObjects) {
+				t.Logf("want: %v", objInfoNames(testCase.result.Objects))
+				t.Logf("got: %v", objInfoNames(foundObjects))
+				t.Errorf("Test %d: %s: Expected number of objects in the result to be '%d', but found '%d' objects instead",
+					i+1, instanceType, len(testCase.result.Objects), len(foundObjects))
+			}
+			for j := 0; j < len(testCase.result.Objects); j++ {
+				if j >= len(foundObjects) {
+					t.Errorf("Test %d: %s: Expected object name to be \"%s\", but not nothing instead", i+1, instanceType, testCase.result.Objects[j].Name)
+					continue
+				}
+				if testCase.result.Objects[j].Name != foundObjects[j].Name {
+					t.Errorf("Test %d: %s: Expected object name to be \"%s\", but found \"%s\" instead", i+1, instanceType, testCase.result.Objects[j].Name, foundObjects[j].Name)
+				}
+			}
+
+			if len(testCase.result.Prefixes) != len(foundPrefixes) {
+				t.Logf("want: %v", testCase.result.Prefixes)
+				t.Logf("got: %v", foundPrefixes)
+				t.Errorf("Test %d: %s: Expected number of prefixes in the result to be '%d', but found '%d' prefixes instead",
+					i+1, instanceType, len(testCase.result.Prefixes), len(foundPrefixes))
+			}
+			for j := 0; j < len(testCase.result.Prefixes); j++ {
+				if j >= len(foundPrefixes) {
+					t.Errorf("Test %d: %s: Expected prefix name to be \"%s\", but found no result", i+1, instanceType, testCase.result.Prefixes[j])
+					continue
+				}
+				if testCase.result.Prefixes[j] != foundPrefixes[j] {
+					t.Errorf("Test %d: %s: Expected prefix name to be \"%s\", but found \"%s\" instead", i+1, instanceType, testCase.result.Prefixes[j], foundPrefixes[j])
+				}
+			}
+		})
+	}
+}
+
 // Initialize FS backend for the benchmark.
 func initFSObjectsB(disk string, t *testing.B) (obj ObjectLayer) {
-	var err error
-	obj, err = NewFSObjectLayer(disk)
+	obj, _, err := initObjectLayer(context.Background(), mustGetPoolEndpoints(0, disk))
 	if err != nil {
-		t.Fatal("Unexpected err: ", err)
+		t.Fatal(err)
 	}
+
+	newTestConfig(globalMinioDefaultRegion, obj)
+
+	initAllSubsystems(GlobalContext)
 	return obj
 }
 
 // BenchmarkListObjects - Run ListObject Repeatedly and benchmark.
 func BenchmarkListObjects(b *testing.B) {
 	// Make a temporary directory to use as the obj.
-	directory, err := ioutil.TempDir(globalTestTmpDir, "minio-list-benchmark")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer os.RemoveAll(directory)
+	directory := b.TempDir()
 
 	// Create the obj.
 	obj := initFSObjectsB(directory, b)
 
 	bucket := "ls-benchmark-bucket"
 	// Create a bucket.
-	err = obj.MakeBucketWithLocation(context.Background(), bucket, BucketOptions{})
+	err := obj.MakeBucket(b.Context(), bucket, MakeBucketOptions{})
 	if err != nil {
 		b.Fatal(err)
 	}
 
 	// Insert objects to be listed and benchmarked later.
-	for i := 0; i < 20000; i++ {
+	for i := range 20000 {
 		key := "obj" + strconv.Itoa(i)
-		_, err = obj.PutObject(context.Background(), bucket, key, mustGetPutObjReader(b, bytes.NewBufferString(key), int64(len(key)), "", ""), ObjectOptions{})
+		_, err = obj.PutObject(b.Context(), bucket, key, mustGetPutObjReader(b, bytes.NewBufferString(key), int64(len(key)), "", ""), ObjectOptions{})
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 
-	b.ResetTimer()
-
 	// List the buckets over and over and over.
-	for i := 0; i < b.N; i++ {
-		_, err = obj.ListObjects(context.Background(), bucket, "", "obj9000", "", -1)
+	for b.Loop() {
+		_, err = obj.ListObjects(b.Context(), bucket, "", "obj9000", "", -1)
 		if err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+func TestListObjectsWithILM(t *testing.T) {
+	ExecObjectLayerTest(t, testListObjectsWithILM)
+}
+
+func testListObjectsWithILM(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
+	// Prepare lifecycle expiration workers
+	es := newExpiryState(t1.Context(), obj, 0)
+	globalExpiryState = es
+
+	t, _ := t1.(*testing.T)
+
+	objContent := "test-content"
+	objMd5 := md5.Sum([]byte(objContent))
+
+	uploads := []struct {
+		bucket     string
+		expired    int
+		notExpired int
+	}{
+		{"test-list-ilm-nothing-expired", 0, 6},
+		{"test-list-ilm-all-expired", 6, 0},
+		{"test-list-ilm-all-half-expired", 3, 3},
+	}
+
+	oneWeekAgo := time.Now().Add(-7 * 24 * time.Hour)
+
+	lifecycleBytes := []byte(`
+<LifecycleConfiguration>
+	<Rule>
+		<Status>Enabled</Status>
+		<Expiration>
+			<Days>1</Days>
+		</Expiration>
+	</Rule>
+</LifecycleConfiguration>
+`)
+
+	lifecycleConfig, err := lifecycle.ParseLifecycleConfig(bytes.NewReader(lifecycleBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, upload := range uploads {
+		err := obj.MakeBucket(context.Background(), upload.bucket, MakeBucketOptions{})
+		if err != nil {
+			t.Fatalf("%s : %s", instanceType, err.Error())
+		}
+
+		metadata, err := globalBucketMetadataSys.Get(upload.bucket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		metadata.lifecycleConfig = lifecycleConfig
+		globalBucketMetadataSys.Set(upload.bucket, metadata)
+		defer globalBucketMetadataSys.Remove(upload.bucket)
+
+		// Upload objects which modtime as one week ago, supposed to be expired by ILM
+		for range upload.expired {
+			_, err := obj.PutObject(context.Background(), upload.bucket, randString(32),
+				mustGetPutObjReader(t,
+					bytes.NewBufferString(objContent),
+					int64(len(objContent)),
+					hex.EncodeToString(objMd5[:]),
+					""),
+				ObjectOptions{MTime: oneWeekAgo},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Upload objects which current time as modtime, not expired by ILM
+		for range upload.notExpired {
+			_, err := obj.PutObject(context.Background(), upload.bucket, randString(32),
+				mustGetPutObjReader(t,
+					bytes.NewBufferString(objContent),
+					int64(len(objContent)),
+					hex.EncodeToString(objMd5[:]),
+					""),
+				ObjectOptions{},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		for _, maxKeys := range []int{1, 10, 49} {
+			// Test ListObjects V2
+			totalObjs, didRuns := 0, 0
+			marker := ""
+			for {
+				didRuns++
+				if didRuns > 1000 {
+					t.Fatal("too many runs")
+					return
+				}
+				result, err := obj.ListObjectsV2(context.Background(), upload.bucket, "", marker, "", maxKeys, false, "")
+				if err != nil {
+					t.Fatalf("Test %d: %s: Expected to pass, but failed with: <ERROR> %s", i, instanceType, err.Error())
+				}
+				totalObjs += len(result.Objects)
+				if !result.IsTruncated {
+					break
+				}
+				if marker != "" && marker == result.NextContinuationToken {
+					t.Fatalf("infinite loop marker: %s", result.NextContinuationToken)
+				}
+				marker = result.NextContinuationToken
+			}
+
+			if totalObjs != upload.notExpired {
+				t.Fatalf("Test %d: %s: max-keys=%d, %d objects are expected to be seen, but %d found instead (didRuns=%d)",
+					i+1, instanceType, maxKeys, upload.notExpired, totalObjs, didRuns)
+			}
 		}
 	}
 }

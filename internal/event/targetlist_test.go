@@ -23,6 +23,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/minio/minio/internal/store"
 )
 
 type ExampleTarget struct {
@@ -40,6 +42,11 @@ func (target ExampleTarget) Save(eventData Event) error {
 	return target.send(eventData)
 }
 
+// Store - Returns a nil store.
+func (target ExampleTarget) Store() TargetStore {
+	return nil
+}
+
 func (target ExampleTarget) send(eventData Event) error {
 	b := make([]byte, 1)
 	if _, err := rand.Read(b); err != nil {
@@ -55,8 +62,8 @@ func (target ExampleTarget) send(eventData Event) error {
 	return nil
 }
 
-// Send - interface compatible method does no-op.
-func (target ExampleTarget) Send(eventKey string) error {
+// SendFromStore - interface compatible method does no-op.
+func (target *ExampleTarget) SendFromStore(_ store.Key) error {
 	return nil
 }
 
@@ -72,20 +79,20 @@ func (target ExampleTarget) IsActive() (bool, error) {
 	return false, errors.New("not connected to target server/service")
 }
 
-// HasQueueStore - No-Op. Added for interface compatibility
-func (target ExampleTarget) HasQueueStore() bool {
-	return false
+// FlushQueueStore - No-Op. Added for interface compatibility
+func (target ExampleTarget) FlushQueueStore() error {
+	return nil
 }
 
 func TestTargetListAdd(t *testing.T) {
-	targetListCase1 := NewTargetList()
+	targetListCase1 := NewTargetList(t.Context())
 
-	targetListCase2 := NewTargetList()
+	targetListCase2 := NewTargetList(t.Context())
 	if err := targetListCase2.Add(&ExampleTarget{TargetID{"2", "testcase"}, false, false}); err != nil {
 		panic(err)
 	}
 
-	targetListCase3 := NewTargetList()
+	targetListCase3 := NewTargetList(t.Context())
 	if err := targetListCase3.Add(&ExampleTarget{TargetID{"3", "testcase"}, false, false}); err != nil {
 		panic(err)
 	}
@@ -133,14 +140,14 @@ func TestTargetListAdd(t *testing.T) {
 }
 
 func TestTargetListExists(t *testing.T) {
-	targetListCase1 := NewTargetList()
+	targetListCase1 := NewTargetList(t.Context())
 
-	targetListCase2 := NewTargetList()
+	targetListCase2 := NewTargetList(t.Context())
 	if err := targetListCase2.Add(&ExampleTarget{TargetID{"2", "testcase"}, false, false}); err != nil {
 		panic(err)
 	}
 
-	targetListCase3 := NewTargetList()
+	targetListCase3 := NewTargetList(t.Context())
 	if err := targetListCase3.Add(&ExampleTarget{TargetID{"3", "testcase"}, false, false}); err != nil {
 		panic(err)
 	}
@@ -165,14 +172,14 @@ func TestTargetListExists(t *testing.T) {
 }
 
 func TestTargetListList(t *testing.T) {
-	targetListCase1 := NewTargetList()
+	targetListCase1 := NewTargetList(t.Context())
 
-	targetListCase2 := NewTargetList()
+	targetListCase2 := NewTargetList(t.Context())
 	if err := targetListCase2.Add(&ExampleTarget{TargetID{"2", "testcase"}, false, false}); err != nil {
 		panic(err)
 	}
 
-	targetListCase3 := NewTargetList()
+	targetListCase3 := NewTargetList(t.Context())
 	if err := targetListCase3.Add(&ExampleTarget{TargetID{"3", "testcase"}, false, false}); err != nil {
 		panic(err)
 	}
@@ -211,51 +218,8 @@ func TestTargetListList(t *testing.T) {
 	}
 }
 
-func TestTargetListSend(t *testing.T) {
-	targetListCase1 := NewTargetList()
-
-	targetListCase2 := NewTargetList()
-	if err := targetListCase2.Add(&ExampleTarget{TargetID{"2", "testcase"}, false, false}); err != nil {
-		panic(err)
-	}
-
-	targetListCase3 := NewTargetList()
-	if err := targetListCase3.Add(&ExampleTarget{TargetID{"3", "testcase"}, false, false}); err != nil {
-		panic(err)
-	}
-
-	targetListCase4 := NewTargetList()
-	if err := targetListCase4.Add(&ExampleTarget{TargetID{"4", "testcase"}, true, false}); err != nil {
-		panic(err)
-	}
-
-	testCases := []struct {
-		targetList *TargetList
-		targetID   TargetID
-		expectErr  bool
-	}{
-		{targetListCase1, TargetID{"1", "webhook"}, false},
-		{targetListCase2, TargetID{"1", "non-existent"}, false},
-		{targetListCase3, TargetID{"3", "testcase"}, false},
-		{targetListCase4, TargetID{"4", "testcase"}, true},
-	}
-
-	resCh := make(chan TargetIDResult)
-	for i, testCase := range testCases {
-		testCase.targetList.Send(Event{}, map[TargetID]struct{}{
-			testCase.targetID: {},
-		}, resCh)
-		res := <-resCh
-		expectErr := (res.Err != nil)
-
-		if expectErr != testCase.expectErr {
-			t.Fatalf("test %v: error: expected: %v, got: %v", i+1, testCase.expectErr, expectErr)
-		}
-	}
-}
-
 func TestNewTargetList(t *testing.T) {
-	if result := NewTargetList(); result == nil {
+	if result := NewTargetList(t.Context()); result == nil {
 		t.Fatalf("test: result: expected: <non-nil>, got: <nil>")
 	}
 }

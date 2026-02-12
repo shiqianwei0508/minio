@@ -18,9 +18,9 @@
 package cmd
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
-	"errors"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
@@ -35,9 +35,9 @@ func TestFixFormatV3(t *testing.T) {
 	for _, erasureDir := range erasureDirs {
 		defer os.RemoveAll(erasureDir)
 	}
-	endpoints := mustGetNewEndpoints(erasureDirs...)
+	endpoints := mustGetNewEndpoints(0, 8, erasureDirs...)
 
-	storageDisks, errs := initStorageDisksWithErrors(endpoints)
+	storageDisks, errs := initStorageDisksWithErrors(endpoints, storageOpts{cleanUp: false, healthCheck: false})
 	for _, err := range errs {
 		if err != nil && err != errDiskNotFound {
 			t.Fatal(err)
@@ -48,14 +48,10 @@ func TestFixFormatV3(t *testing.T) {
 	format.Erasure.DistributionAlgo = formatErasureVersionV2DistributionAlgoV1
 	formats := make([]*formatErasureV3, 8)
 
-	for j := 0; j < 8; j++ {
+	for j := range 8 {
 		newFormat := format.Clone()
 		newFormat.Erasure.This = format.Erasure.Sets[0][j]
 		formats[j] = newFormat
-	}
-
-	if err = initErasureMetaVolumesInLocalDisks(storageDisks, formats); err != nil {
-		t.Fatal(err)
 	}
 
 	formats[1] = nil
@@ -83,7 +79,7 @@ func TestFormatErasureEmpty(t *testing.T) {
 	format.Erasure.DistributionAlgo = formatErasureVersionV2DistributionAlgoV1
 	formats := make([]*formatErasureV3, 16)
 
-	for j := 0; j < 16; j++ {
+	for j := range 16 {
 		newFormat := format.Clone()
 		newFormat.Erasure.This = format.Erasure.Sets[0][j]
 		formats[j] = newFormat
@@ -106,11 +102,7 @@ func TestFormatErasureEmpty(t *testing.T) {
 // Tests xl format migration.
 func TestFormatErasureMigrate(t *testing.T) {
 	// Get test root.
-	rootPath, err := getTestRoot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(rootPath)
+	rootPath := t.TempDir()
 
 	m := &formatErasureV1{}
 	m.Format = formatBackendErasure
@@ -124,19 +116,20 @@ func TestFormatErasureMigrate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err = os.MkdirAll(pathJoin(rootPath, minioMetaBucket), os.FileMode(0755)); err != nil {
+	if err = os.MkdirAll(pathJoin(rootPath, minioMetaBucket), os.FileMode(0o755)); err != nil {
 		t.Fatal(err)
 	}
 
-	if err = ioutil.WriteFile(pathJoin(rootPath, minioMetaBucket, formatConfigFile), b, os.FileMode(0644)); err != nil {
+	if err = os.WriteFile(pathJoin(rootPath, minioMetaBucket, formatConfigFile), b, os.FileMode(0o644)); err != nil {
 		t.Fatal(err)
 	}
 
-	if err = formatErasureMigrate(rootPath); err != nil {
+	formatData, _, err := formatErasureMigrate(rootPath)
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	migratedVersion, err := formatGetBackendErasureVersion(pathJoin(rootPath, minioMetaBucket, formatConfigFile))
+	migratedVersion, err := formatGetBackendErasureVersion(formatData)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +138,7 @@ func TestFormatErasureMigrate(t *testing.T) {
 		t.Fatalf("expected version: %s, got: %s", formatErasureVersionV3, migratedVersion)
 	}
 
-	b, err = ioutil.ReadFile(pathJoin(rootPath, minioMetaBucket, formatConfigFile))
+	b, err = os.ReadFile(pathJoin(rootPath, minioMetaBucket, formatConfigFile))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,13 +147,13 @@ func TestFormatErasureMigrate(t *testing.T) {
 		t.Fatal(err)
 	}
 	if formatV3.Erasure.This != m.Erasure.Disk {
-		t.Fatalf("expected disk uuid: %s, got: %s", m.Erasure.Disk, formatV3.Erasure.This)
+		t.Fatalf("expected drive uuid: %s, got: %s", m.Erasure.Disk, formatV3.Erasure.This)
 	}
 	if len(formatV3.Erasure.Sets) != 1 {
 		t.Fatalf("expected single set after migrating from v1 to v3, but found %d", len(formatV3.Erasure.Sets))
 	}
 	if !reflect.DeepEqual(formatV3.Erasure.Sets[0], m.Erasure.JBOD) {
-		t.Fatalf("expected disk uuid: %v, got: %v", m.Erasure.JBOD, formatV3.Erasure.Sets[0])
+		t.Fatalf("expected drive uuid: %v, got: %v", m.Erasure.JBOD, formatV3.Erasure.Sets[0])
 	}
 
 	m = &formatErasureV1{}
@@ -175,11 +168,11 @@ func TestFormatErasureMigrate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err = ioutil.WriteFile(pathJoin(rootPath, minioMetaBucket, formatConfigFile), b, os.FileMode(0644)); err != nil {
+	if err = os.WriteFile(pathJoin(rootPath, minioMetaBucket, formatConfigFile), b, os.FileMode(0o644)); err != nil {
 		t.Fatal(err)
 	}
 
-	if err = formatErasureMigrate(rootPath); err == nil {
+	if _, _, err = formatErasureMigrate(rootPath); err == nil {
 		t.Fatal("Expected to fail with unexpected backend format")
 	}
 
@@ -195,11 +188,11 @@ func TestFormatErasureMigrate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err = ioutil.WriteFile(pathJoin(rootPath, minioMetaBucket, formatConfigFile), b, os.FileMode(0644)); err != nil {
+	if err = os.WriteFile(pathJoin(rootPath, minioMetaBucket, formatConfigFile), b, os.FileMode(0o644)); err != nil {
 		t.Fatal(err)
 	}
 
-	if err = formatErasureMigrate(rootPath); err == nil {
+	if _, _, err = formatErasureMigrate(rootPath); err == nil {
 		t.Fatal("Expected to fail with unexpected backend format version number")
 	}
 }
@@ -283,8 +276,8 @@ func TestGetFormatErasureInQuorumCheck(t *testing.T) {
 	format.Erasure.DistributionAlgo = formatErasureVersionV2DistributionAlgoV1
 	formats := make([]*formatErasureV3, 32)
 
-	for i := 0; i < setCount; i++ {
-		for j := 0; j < setDriveCount; j++ {
+	for i := range setCount {
+		for j := range setDriveCount {
 			newFormat := format.Clone()
 			newFormat.Erasure.This = format.Erasure.Sets[i][j]
 			formats[i*setDriveCount+j] = newFormat
@@ -341,59 +334,97 @@ func TestGetFormatErasureInQuorumCheck(t *testing.T) {
 	}
 }
 
-// Tests formatErasureGetDeploymentID()
-func TestGetErasureID(t *testing.T) {
-	setCount := 2
-	setDriveCount := 8
+// Get backend Erasure format in quorum `format.json`.
+func getFormatErasureInQuorumOld(formats []*formatErasureV3) (*formatErasureV3, error) {
+	formatHashes := make([]string, len(formats))
+	for i, format := range formats {
+		if format == nil {
+			continue
+		}
+		h := sha256.New()
+		for _, set := range format.Erasure.Sets {
+			for _, diskID := range set {
+				h.Write([]byte(diskID))
+			}
+		}
+		formatHashes[i] = hex.EncodeToString(h.Sum(nil))
+	}
+
+	formatCountMap := make(map[string]int)
+	for _, hash := range formatHashes {
+		if hash == "" {
+			continue
+		}
+		formatCountMap[hash]++
+	}
+
+	maxHash := ""
+	maxCount := 0
+	for hash, count := range formatCountMap {
+		if count > maxCount {
+			maxCount = count
+			maxHash = hash
+		}
+	}
+
+	if maxCount < len(formats)/2 {
+		return nil, errErasureReadQuorum
+	}
+
+	for i, hash := range formatHashes {
+		if hash == maxHash {
+			format := formats[i].Clone()
+			format.Erasure.This = ""
+			return format, nil
+		}
+	}
+
+	return nil, errErasureReadQuorum
+}
+
+func BenchmarkGetFormatErasureInQuorumOld(b *testing.B) {
+	setCount := 200
+	setDriveCount := 15
 
 	format := newFormatErasureV3(setCount, setDriveCount)
 	format.Erasure.DistributionAlgo = formatErasureVersionV2DistributionAlgoV1
-	formats := make([]*formatErasureV3, 16)
+	formats := make([]*formatErasureV3, 15*200)
 
-	for i := 0; i < setCount; i++ {
-		for j := 0; j < setDriveCount; j++ {
+	for i := range setCount {
+		for j := range setDriveCount {
 			newFormat := format.Clone()
 			newFormat.Erasure.This = format.Erasure.Sets[i][j]
 			formats[i*setDriveCount+j] = newFormat
 		}
 	}
 
-	// Return a format from list of formats in quorum.
-	quorumFormat, err := getFormatErasureInQuorum(formats)
-	if err != nil {
-		t.Fatal(err)
+	b.ReportAllocs()
+
+	for b.Loop() {
+		_, _ = getFormatErasureInQuorumOld(formats)
+	}
+}
+
+func BenchmarkGetFormatErasureInQuorum(b *testing.B) {
+	setCount := 200
+	setDriveCount := 15
+
+	format := newFormatErasureV3(setCount, setDriveCount)
+	format.Erasure.DistributionAlgo = formatErasureVersionV2DistributionAlgoV1
+	formats := make([]*formatErasureV3, 15*200)
+
+	for i := range setCount {
+		for j := range setDriveCount {
+			newFormat := format.Clone()
+			newFormat.Erasure.This = format.Erasure.Sets[i][j]
+			formats[i*setDriveCount+j] = newFormat
+		}
 	}
 
-	// Check if the reference format and input formats are same.
-	var id string
-	if id, err = formatErasureGetDeploymentID(quorumFormat, formats); err != nil {
-		t.Fatal(err)
-	}
+	b.ReportAllocs()
 
-	if id == "" {
-		t.Fatal("ID cannot be empty.")
-	}
-
-	formats[0] = nil
-	if id, err = formatErasureGetDeploymentID(quorumFormat, formats); err != nil {
-		t.Fatal(err)
-	}
-	if id == "" {
-		t.Fatal("ID cannot be empty.")
-	}
-
-	formats[1].Erasure.Sets[0][0] = "bad-uuid"
-	if id, err = formatErasureGetDeploymentID(quorumFormat, formats); err != nil {
-		t.Fatal(err)
-	}
-
-	if id == "" {
-		t.Fatal("ID cannot be empty.")
-	}
-
-	formats[2].ID = "bad-id"
-	if _, err = formatErasureGetDeploymentID(quorumFormat, formats); !errors.Is(err, errCorruptedFormat) {
-		t.Fatalf("Unexpect error %s", err)
+	for b.Loop() {
+		_, _ = getFormatErasureInQuorum(formats)
 	}
 }
 
@@ -407,8 +438,8 @@ func TestNewFormatSets(t *testing.T) {
 	formats := make([]*formatErasureV3, 32)
 	errs := make([]error, 32)
 
-	for i := 0; i < setCount; i++ {
-		for j := 0; j < setDriveCount; j++ {
+	for i := range setCount {
+		for j := range setDriveCount {
 			newFormat := format.Clone()
 			newFormat.Erasure.This = format.Erasure.Sets[i][j]
 			formats[i*setDriveCount+j] = newFormat
@@ -423,7 +454,7 @@ func TestNewFormatSets(t *testing.T) {
 	// 16th disk is unformatted.
 	errs[15] = errUnformattedDisk
 
-	newFormats := newHealFormatSets(quorumFormat, setCount, setDriveCount, formats, errs)
+	newFormats, _ := newHealFormatSets(quorumFormat, setCount, setDriveCount, formats, errs)
 	if newFormats == nil {
 		t.Fatal("Unexpected failure")
 	}
@@ -465,11 +496,12 @@ func benchmarkInitStorageDisksN(b *testing.B, nDisks int) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	endpoints := mustGetNewEndpoints(fsDirs...)
+
+	endpoints := mustGetNewEndpoints(0, 16, fsDirs...)
 	b.RunParallel(func(pb *testing.PB) {
 		endpoints := endpoints
 		for pb.Next() {
-			initStorageDisksWithErrors(endpoints)
+			initStorageDisksWithErrors(endpoints, storageOpts{cleanUp: false, healthCheck: false})
 		}
 	})
 }

@@ -22,6 +22,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/minio/madmin-go/v3/logger/audit"
+
 	"github.com/minio/minio/internal/handlers"
 	xhttp "github.com/minio/minio/internal/http"
 )
@@ -29,48 +31,24 @@ import (
 // Version - represents the current version of audit log structure.
 const Version = "1"
 
-// Entry - audit entry logs.
-type Entry struct {
-	Version      string `json:"version"`
-	DeploymentID string `json:"deploymentid,omitempty"`
-	Time         string `json:"time"`
-	Trigger      string `json:"trigger"`
-	API          struct {
-		Name            string `json:"name,omitempty"`
-		Bucket          string `json:"bucket,omitempty"`
-		Object          string `json:"object,omitempty"`
-		Status          string `json:"status,omitempty"`
-		StatusCode      int    `json:"statusCode,omitempty"`
-		TimeToFirstByte string `json:"timeToFirstByte,omitempty"`
-		TimeToResponse  string `json:"timeToResponse,omitempty"`
-	} `json:"api"`
-	RemoteHost string                 `json:"remotehost,omitempty"`
-	RequestID  string                 `json:"requestID,omitempty"`
-	UserAgent  string                 `json:"userAgent,omitempty"`
-	ReqClaims  map[string]interface{} `json:"requestClaims,omitempty"`
-	ReqQuery   map[string]string      `json:"requestQuery,omitempty"`
-	ReqHeader  map[string]string      `json:"requestHeader,omitempty"`
-	RespHeader map[string]string      `json:"responseHeader,omitempty"`
-	Tags       map[string]interface{} `json:"tags,omitempty"`
-}
-
 // NewEntry - constructs an audit entry object with some fields filled
-func NewEntry(deploymentID string) Entry {
-	return Entry{
+func NewEntry(deploymentID string) audit.Entry {
+	return audit.Entry{
 		Version:      Version,
 		DeploymentID: deploymentID,
-		Time:         time.Now().UTC().Format(time.RFC3339Nano),
+		Time:         time.Now().UTC(),
 	}
 }
 
 // ToEntry - constructs an audit entry from a http request
-func ToEntry(w http.ResponseWriter, r *http.Request, reqClaims map[string]interface{}, deploymentID string) Entry {
-
+func ToEntry(w http.ResponseWriter, r *http.Request, reqClaims map[string]any, deploymentID string) audit.Entry {
 	entry := NewEntry(deploymentID)
 
 	entry.RemoteHost = handlers.GetSourceIP(r)
 	entry.UserAgent = r.UserAgent()
 	entry.ReqClaims = reqClaims
+	entry.ReqHost = r.Host
+	entry.ReqPath = r.URL.Path
 
 	q := r.URL.Query()
 	reqQuery := make(map[string]string, len(q))

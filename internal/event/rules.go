@@ -20,7 +20,7 @@ package event
 import (
 	"strings"
 
-	"github.com/minio/pkg/wildcard"
+	"github.com/minio/pkg/v3/wildcard"
 )
 
 // NewPattern - create new pattern for prefix/suffix.
@@ -41,7 +41,7 @@ func NewPattern(prefix, suffix string) (pattern string) {
 		pattern += suffix
 	}
 
-	pattern = strings.Replace(pattern, "**", "*", -1)
+	pattern = strings.ReplaceAll(pattern, "**", "*")
 
 	return pattern
 }
@@ -99,7 +99,7 @@ func (rules Rules) Union(rules2 Rules) Rules {
 	return nrules
 }
 
-// Difference - returns diffrence with given rules as new rules.
+// Difference - returns difference with given rules as new rules.
 func (rules Rules) Difference(rules2 Rules) Rules {
 	nrules := make(Rules)
 

@@ -29,24 +29,48 @@ func TestParseStorageClass(t *testing.T) {
 		wantSc          StorageClass
 		expectedError   error
 	}{
-		{"EC:3", StorageClass{
-			Parity: 3},
-			nil},
-		{"EC:4", StorageClass{
-			Parity: 4},
-			nil},
-		{"AB:4", StorageClass{
-			Parity: 4},
-			errors.New("Unsupported scheme AB. Supported scheme is EC")},
-		{"EC:4:5", StorageClass{
-			Parity: 4},
-			errors.New("Too many sections in EC:4:5")},
-		{"EC:A", StorageClass{
-			Parity: 4},
-			errors.New(`strconv.Atoi: parsing "A": invalid syntax`)},
-		{"AB", StorageClass{
-			Parity: 4},
-			errors.New("Too few sections in AB")},
+		{
+			"EC:3",
+			StorageClass{
+				Parity: 3,
+			},
+			nil,
+		},
+		{
+			"EC:4",
+			StorageClass{
+				Parity: 4,
+			},
+			nil,
+		},
+		{
+			"AB:4",
+			StorageClass{
+				Parity: 4,
+			},
+			errors.New("Unsupported scheme AB. Supported scheme is EC"),
+		},
+		{
+			"EC:4:5",
+			StorageClass{
+				Parity: 4,
+			},
+			errors.New("Too many sections in EC:4:5"),
+		},
+		{
+			"EC:A",
+			StorageClass{
+				Parity: 4,
+			},
+			errors.New(`strconv.Atoi: parsing "A": invalid syntax`),
+		},
+		{
+			"AB",
+			StorageClass{
+				Parity: 4,
+			},
+			errors.New("Too few sections in AB"),
+		},
 	}
 	for i, tt := range tests {
 		gotSc, err := parseStorageClass(tt.storageClassEnv)
@@ -78,7 +102,8 @@ func TestValidateParity(t *testing.T) {
 		{2, 4, true, 16},
 		{3, 3, true, 16},
 		{0, 0, true, 16},
-		{1, 4, false, 16},
+		{1, 4, true, 16},
+		{0, 4, true, 16},
 		{7, 6, false, 16},
 		{9, 0, false, 16},
 		{9, 9, false, 16},
@@ -99,7 +124,7 @@ func TestValidateParity(t *testing.T) {
 func TestParityCount(t *testing.T) {
 	tests := []struct {
 		sc             string
-		disksCount     int
+		drivesCount    int
 		expectedData   int
 		expectedParity int
 	}{
@@ -116,8 +141,9 @@ func TestParityCount(t *testing.T) {
 				Parity: 8,
 			},
 			RRS: StorageClass{
-				Parity: 0,
+				Parity: 2,
 			},
+			initialized: true,
 		}
 		// Set env var for test case 4
 		if i+1 == 4 {
@@ -132,12 +158,12 @@ func TestParityCount(t *testing.T) {
 			scfg.Standard.Parity = 7
 		}
 		parity := scfg.GetParityForSC(tt.sc)
-		if (tt.disksCount - parity) != tt.expectedData {
-			t.Errorf("Test %d, Expected data disks %d, got %d", i+1, tt.expectedData, tt.disksCount-parity)
+		if (tt.drivesCount - parity) != tt.expectedData {
+			t.Errorf("Test %d, Expected data drives %d, got %d", i+1, tt.expectedData, tt.drivesCount-parity)
 			continue
 		}
 		if parity != tt.expectedParity {
-			t.Errorf("Test %d, Expected parity disks %d, got %d", i+1, tt.expectedParity, parity)
+			t.Errorf("Test %d, Expected parity drives %d, got %d", i+1, tt.expectedParity, parity)
 		}
 	}
 }

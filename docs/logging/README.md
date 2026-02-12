@@ -1,19 +1,24 @@
 # MinIO Logging Quickstart Guide [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io)
+
 This document explains how to configure MinIO server to log to different logging targets.
 
 ## Log Targets
+
 MinIO supports currently two target types
 
 - console
 - http
 
-### Console Target
+### Logging Console Target
+
 Console target is on always and cannot be disabled.
 
-### HTTP Target
+### Logging HTTP Target
+
 HTTP target logs to a generic HTTP endpoint in JSON format and is not enabled by default. To enable HTTP target logging you would have to update your MinIO server configuration using `mc admin config set` command.
 
-Assuming `mc` is already [configured](https://docs.min.io/docs/minio-client-quickstart-guide.html)
+Assuming `mc` is already [configured](https://docs.min.io/community/minio-object-store/reference/minio-mc.html#quickstart)
+
 ```
 mc admin config get myminio/ logger_webhook
 logger_webhook:name1 auth_token="" endpoint=""
@@ -27,6 +32,7 @@ mc admin service restart myminio
 NOTE: `http://endpoint:port/path` is a placeholder value to indicate the URL format, please change this accordingly as per your configuration.
 
 MinIO also honors environment variable for HTTP target logging as shown below, this setting will override the endpoint settings in the MinIO server config.
+
 ```
 export MINIO_LOGGER_WEBHOOK_ENABLE_target1="on"
 export MINIO_LOGGER_WEBHOOK_AUTH_TOKEN_target1="token"
@@ -35,9 +41,11 @@ minio server /mnt/data
 ```
 
 ## Audit Targets
-Assuming `mc` is already [configured](https://docs.min.io/docs/minio-client-quickstart-guide.html)
 
-### HTTP Target
+Assuming `mc` is already [configured](https://docs.min.io/community/minio-object-store/reference/minio-mc.html#quickstart)
+
+### Audit HTTP Target
+
 ```
 mc admin config get myminio/ audit_webhook
 audit_webhook:name1 enable=off endpoint= auth_token= client_cert= client_key=
@@ -51,6 +59,7 @@ mc admin service restart myminio
 NOTE: `http://endpoint:port/path` is a placeholder value to indicate the URL format, please change this accordingly as per your configuration.
 
 MinIO also honors environment variable for HTTP target Audit logging as shown below, this setting will override the endpoint settings in the MinIO server config.
+
 ```
 export MINIO_AUDIT_WEBHOOK_ENABLE_target1="on"
 export MINIO_AUDIT_WEBHOOK_AUTH_TOKEN_target1="token"
@@ -63,66 +72,79 @@ minio server /mnt/data
 Setting this environment variable automatically enables audit logging to the HTTP target. The audit logging is in JSON format as described below.
 
 NOTE:
+
 - `timeToFirstByte` and `timeToResponse` will be expressed in Nanoseconds.
-- Additionally in the case of the erasure coded setup `tags.objectErasureMap` provides per object details about
-   - Pool number the object operation was performed on.
-   - Set number the object operation was performed on.
-   - The list of disks participating in this operation belong to the set.
+- Additionally in the case of the erasure coded setup `tags.objectLocation` provides per object details about
+  - Pool number the object operation was performed on.
+  - Set number the object operation was performed on.
+  - The list of drives participating in this operation belong to the set.
 
 ```json
 {
   "version": "1",
-  "deploymentid": "bc0e4d1e-bacc-42eb-91ad-2d7f3eacfa8d",
-  "time": "2019-08-12T21:34:37.187817748Z",
+  "deploymentid": "90e81272-45d9-4fe8-9c45-c9a7322bf4b5",
+  "time": "2024-05-09T07:38:10.449688982Z",
+  "event": "",
+  "trigger": "incoming",
   "api": {
     "name": "PutObject",
     "bucket": "testbucket",
     "object": "hosts",
     "status": "OK",
     "statusCode": 200,
-    "timeToFirstByte": "366333ns",
-    "timeToResponse": "16438202ns"
+    "rx": 401,
+    "tx": 0,
+    "timeToResponse": "13309747ns",
+    "timeToResponseInNS": "13309747"
   },
   "remotehost": "127.0.0.1",
-  "requestID": "15BA4A72C0C70AFC",
-  "userAgent": "MinIO (linux; amd64) minio-go/v6.0.32 mc/2019-08-12T18:27:13Z",
+  "requestID": "17CDC1F4D7E69123",
+  "userAgent": "MinIO (linux; amd64) minio-go/v7.0.70 mc/RELEASE.2024-04-30T17-44-48Z",
+  "requestPath": "/testbucket/hosts",
+  "requestHost": "localhost:9000",
   "requestHeader": {
-    "Authorization": "AWS4-HMAC-SHA256 Credential=minio/20190812/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length,Signature=d3f02a6aeddeb29b06e1773b6a8422112890981269f2463a26f307b60423177c",
-    "Content-Length": "686",
+    "Accept-Encoding": "zstd,gzip",
+    "Authorization": "AWS4-HMAC-SHA256 Credential=minioadmin/20240509/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length,Signature=d4d6862e6cc61011a61fa801da71048ece4f32a0562cad6bb88bdda50d7fcb95",
+    "Content-Length": "401",
     "Content-Type": "application/octet-stream",
-    "User-Agent": "MinIO (linux; amd64) minio-go/v6.0.32 mc/2019-08-12T18:27:13Z",
+    "User-Agent": "MinIO (linux; amd64) minio-go/v7.0.70 mc/RELEASE.2024-04-30T17-44-48Z",
     "X-Amz-Content-Sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
-    "X-Amz-Date": "20190812T213437Z",
-    "X-Amz-Decoded-Content-Length": "512"
+    "X-Amz-Date": "20240509T073810Z",
+    "X-Amz-Decoded-Content-Length": "228"
   },
   "responseHeader": {
     "Accept-Ranges": "bytes",
     "Content-Length": "0",
-    "Content-Security-Policy": "block-all-mixed-content",
-    "ETag": "a414c889dc276457bd7175f974332cb0-1",
-    "Server": "MinIO/DEVELOPMENT.2019-08-12T21-28-07Z",
-    "Vary": "Origin",
-    "X-Amz-Request-Id": "15BA4A72C0C70AFC",
+    "ETag": "9fe7a344ef4227d3e53751e9d88ce41e",
+    "Server": "MinIO",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "Vary": "Origin,Accept-Encoding",
+    "X-Amz-Id-2": "dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8",
+    "X-Amz-Request-Id": "17CDC1F4D7E69123",
+    "X-Content-Type-Options": "nosniff",
     "X-Xss-Protection": "1; mode=block"
   },
   "tags": {
-    "objectErasureMap": {
-      "object": {
-        "poolId": 1,
-        "setId": 10,
-        "disks": [
-          "http://server01/mnt/pool1/disk01",
-          "http://server02/mnt/pool1/disk02",
-          "http://server03/mnt/pool1/disk03",
-          "http://server04/mnt/pool1/disk04"
-        ]
-     }
-  }
+    "objectLocation": {
+      "name": "hosts",
+      "poolId": 1,
+      "setId": 1,
+      "drives": [
+        "/mnt/data1",
+        "/mnt/data2",
+        "/mnt/data3",
+        "/mnt/data4"
+      ]
+    }
+  },
+  "accessKey": "minioadmin"
 }
 ```
 
 ### Kafka Target
+
 Assuming that you already have Apache Kafka configured and running.
+
 ```
 mc admin config set myminio/ audit_kafka
 KEY:
@@ -145,6 +167,7 @@ comment          (sentence)  optionally add a comment to this setting
 ```
 
 Configure MinIO to send audit logs to locally running Kafka brokers
+
 ```
 mc admin config set myminio/ audit_kafka:target1 brokers=localhost:29092 topic=auditlog
 mc admin service restart myminio/
@@ -155,7 +178,7 @@ On another terminal assuming you have `kafkacat` installed
 ```
 kafkacat -b localhost:29092 -t auditlog  -C
 
-{"version":"1","deploymentid":"8a1d8091-b874-45df-b9ea-e044eede6ace","time":"2021-07-13T02:00:47.020547414Z","trigger":"incoming","api":{"name":"ListBuckets","status":"OK","statusCode":200,"timeToFirstByte":"261795ns","timeToResponse":"312490ns"},"remotehost":"127.0.0.1","requestID":"16913736591C237F","userAgent":"MinIO (linux; amd64) minio-go/v7.0.11 mc/DEVELOPMENT.2021-07-09T02-22-26Z","requestHeader":{"Authorization":"AWS4-HMAC-SHA256 Credential=minio/20210713/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=7fe65c5467e05ca21de64094688da43f96f34fec82e8955612827079f4600527","User-Agent":"MinIO (linux; amd64) minio-go/v7.0.11 mc/DEVELOPMENT.2021-07-09T02-22-26Z","X-Amz-Content-Sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","X-Amz-Date":"20210713T020047Z"},"responseHeader":{"Accept-Ranges":"bytes","Content-Length":"547","Content-Security-Policy":"block-all-mixed-content","Content-Type":"application/xml","Server":"MinIO","Vary":"Origin,Accept-Encoding","X-Amz-Request-Id":"16913736591C237F","X-Xss-Protection":"1; mode=block"}}
+{"version":"1","deploymentid":"90e81272-45d9-4fe8-9c45-c9a7322bf4b5","time":"2024-05-09T07:38:10.449688982Z","event":"","trigger":"incoming","api":{"name":"PutObject","bucket":"testbucket","object":"hosts","status":"OK","statusCode":200,"rx":401,"tx":0,"timeToResponse":"13309747ns","timeToResponseInNS":"13309747"},"remotehost":"127.0.0.1","requestID":"17CDC1F4D7E69123","userAgent":"MinIO (linux; amd64) minio-go/v7.0.70 mc/RELEASE.2024-04-30T17-44-48Z","requestPath":"/testbucket/hosts","requestHost":"localhost:9000","requestHeader":{"Accept-Encoding":"zstd,gzip","Authorization":"AWS4-HMAC-SHA256 Credential=minioadmin/20240509/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length,Signature=d4d6862e6cc61011a61fa801da71048ece4f32a0562cad6bb88bdda50d7fcb95","Content-Length":"401","Content-Type":"application/octet-stream","User-Agent":"MinIO (linux; amd64) minio-go/v7.0.70 mc/RELEASE.2024-04-30T17-44-48Z","X-Amz-Content-Sha256":"STREAMING-AWS4-HMAC-SHA256-PAYLOAD","X-Amz-Date":"20240509T073810Z","X-Amz-Decoded-Content-Length":"228"},"responseHeader":{"Accept-Ranges":"bytes","Content-Length":"0","ETag":"9fe7a344ef4227d3e53751e9d88ce41e","Server":"MinIO","Strict-Transport-Security":"max-age=31536000; includeSubDomains","Vary":"Origin,Accept-Encoding","X-Amz-Id-2":"dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8","X-Amz-Request-Id":"17CDC1F4D7E69123","X-Content-Type-Options":"nosniff","X-Xss-Protection":"1; mode=block"},"tags":{"objectLocation":{"name":"hosts","poolId":1,"setId":1,"drives":["/mnt/data1","/mnt/data2","/mnt/data3","/mnt/data4"]}},"accessKey":"minioadmin"}
 ```
 
 MinIO also honors environment variable for Kafka target Audit logging as shown below, this setting will override the endpoint settings in the MinIO server config.
@@ -192,12 +215,14 @@ minio server /mnt/data
 Setting this environment variable automatically enables audit logging to the Kafka target. The audit logging is in JSON format as described below.
 
 NOTE:
+
 - `timeToFirstByte` and `timeToResponse` will be expressed in Nanoseconds.
-- Additionally in the case of the erasure coded setup `tags.objectErasureMap` provides per object details about
-   - Pool number the object operation was performed on.
-   - Set number the object operation was performed on.
-   - The list of disks participating in this operation belong to the set.
+- Additionally in the case of the erasure coded setup `tags.objectLocation` provides per object details about
+  - Pool number the object operation was performed on.
+  - Set number the object operation was performed on.
+  - The list of drives participating in this operation belong to the set.
 
 ## Explore Further
-* [MinIO Quickstart Guide](https://docs.min.io/docs/minio-quickstart-guide)
-* [Configure MinIO Server with TLS](https://docs.min.io/docs/how-to-secure-access-to-minio-server-with-tls)
+
+- [MinIO Quickstart Guide](https://docs.min.io/community/minio-object-store/operations/deployments/baremetal-deploy-minio-on-redhat-linux.html)
+- [Configure MinIO Server with TLS](https://docs.min.io/community/minio-object-store/operations/network-encryption.html)

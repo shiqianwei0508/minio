@@ -49,8 +49,8 @@ var generateKeyTests = []struct {
 }
 
 func TestGenerateKey(t *testing.T) {
-	defer func(disableLog bool) { logger.Disable = disableLog }(logger.Disable)
-	logger.Disable = true
+	defer func(l bool) { logger.DisableLog = l }(logger.DisableLog)
+	logger.DisableLog = true
 
 	for i, test := range generateKeyTests {
 		i, test := i, test
@@ -75,8 +75,8 @@ var generateIVTests = []struct {
 }
 
 func TestGenerateIV(t *testing.T) {
-	defer func(disableLog bool) { logger.Disable = disableLog }(logger.Disable)
-	logger.Disable = true
+	defer func(l bool) { logger.DisableLog = l }(logger.DisableLog)
+	logger.DisableLog = true
 
 	for i, test := range generateIVTests {
 		i, test := i, test
@@ -164,7 +164,7 @@ func TestDerivePartKey(t *testing.T) {
 			t.Fatalf("Test %d failed to decode expected part-key: %v", i, err)
 		}
 		partKey := key.DerivePartKey(test.PartID)
-		if !bytes.Equal(partKey[:], expectedPartKey[:]) {
+		if !bytes.Equal(partKey[:], expectedPartKey) {
 			t.Errorf("Test %d derives wrong part-key: got '%s' want: '%s'", i, hex.EncodeToString(partKey[:]), test.PartKey)
 		}
 	}

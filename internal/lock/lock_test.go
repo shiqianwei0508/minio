@@ -18,7 +18,6 @@
 package lock
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 	"time"
@@ -26,7 +25,7 @@ import (
 
 // Test lock fails.
 func TestLockFail(t *testing.T) {
-	f, err := ioutil.TempFile("", "lock")
+	f, err := os.CreateTemp(t.TempDir(), "lock")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +37,7 @@ func TestLockFail(t *testing.T) {
 		}
 	}()
 
-	_, err = LockedOpenFile(f.Name(), os.O_APPEND, 0600)
+	_, err = LockedOpenFile(f.Name(), os.O_APPEND, 0o600)
 	if err == nil {
 		t.Fatal("Should fail here")
 	}
@@ -46,18 +45,9 @@ func TestLockFail(t *testing.T) {
 
 // Tests lock directory fail.
 func TestLockDirFail(t *testing.T) {
-	d, err := ioutil.TempDir("", "lockDir")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		err = os.Remove(d)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}()
+	d := t.TempDir()
 
-	_, err = LockedOpenFile(d, os.O_APPEND, 0600)
+	_, err := LockedOpenFile(d, os.O_APPEND, 0o600)
 	if err == nil {
 		t.Fatal("Should fail here")
 	}
@@ -65,7 +55,7 @@ func TestLockDirFail(t *testing.T) {
 
 // Tests rwlock methods.
 func TestRWLockedFile(t *testing.T) {
-	f, err := ioutil.TempFile("", "lock")
+	f, err := os.CreateTemp(t.TempDir(), "lock")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +118,7 @@ func TestRWLockedFile(t *testing.T) {
 
 // Tests lock and unlock semantics.
 func TestLockAndUnlock(t *testing.T) {
-	f, err := ioutil.TempFile("", "lock")
+	f, err := os.CreateTemp(t.TempDir(), "lock")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +131,7 @@ func TestLockAndUnlock(t *testing.T) {
 	}()
 
 	// lock the file
-	l, err := LockedOpenFile(f.Name(), os.O_WRONLY, 0600)
+	l, err := LockedOpenFile(f.Name(), os.O_WRONLY, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +142,7 @@ func TestLockAndUnlock(t *testing.T) {
 	}
 
 	// try lock the unlocked file
-	dupl, err := LockedOpenFile(f.Name(), os.O_WRONLY|os.O_CREATE, 0600)
+	dupl, err := LockedOpenFile(f.Name(), os.O_WRONLY|os.O_CREATE, 0o600)
 	if err != nil {
 		t.Errorf("err = %v, want %v", err, nil)
 	}
@@ -160,7 +150,7 @@ func TestLockAndUnlock(t *testing.T) {
 	// blocking on locked file
 	locked := make(chan struct{}, 1)
 	go func() {
-		bl, blerr := LockedOpenFile(f.Name(), os.O_WRONLY, 0600)
+		bl, blerr := LockedOpenFile(f.Name(), os.O_WRONLY, 0o600)
 		if blerr != nil {
 			t.Error(blerr)
 			return

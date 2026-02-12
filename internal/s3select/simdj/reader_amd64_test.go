@@ -20,7 +20,7 @@ package simdj
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -31,7 +31,7 @@ import (
 )
 
 type tester interface {
-	Fatal(args ...interface{})
+	Fatal(args ...any)
 }
 
 func loadCompressed(t tester, file string) (js []byte) {
@@ -40,7 +40,7 @@ func loadCompressed(t tester, file string) (js []byte) {
 		t.Fatal(err)
 	}
 	defer dec.Close()
-	js, err = ioutil.ReadFile(filepath.Join("testdata", file+".json.zst"))
+	js, err = os.ReadFile(filepath.Join("testdata", file+".json.zst"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,6 @@ func TestNDJSON(t *testing.T) {
 	}
 
 	for _, tt := range testCases {
-
 		t.Run(tt.name, func(t *testing.T) {
 			ref := loadCompressed(t, tt.name)
 
@@ -87,7 +86,7 @@ func TestNDJSON(t *testing.T) {
 			if false {
 				t.Log(string(b))
 			}
-			//_ = ioutil.WriteFile(filepath.Join("testdata", tt.name+".json"), b, os.ModePerm)
+			// _ = os.WriteFile(filepath.Join("testdata", tt.name+".json"), b, os.ModePerm)
 
 		parser:
 			for {
@@ -122,7 +121,7 @@ func TestNDJSON(t *testing.T) {
 					t.Fatal("unexpected type:", typ.String())
 				}
 			}
-			refDec := json.NewReader(ioutil.NopCloser(bytes.NewBuffer(ref)), &json.ReaderArgs{ContentType: "json"})
+			refDec := json.NewReader(io.NopCloser(bytes.NewBuffer(ref)), &json.ReaderArgs{ContentType: "json"})
 
 			for {
 				rec, err := dec.Read(nil)

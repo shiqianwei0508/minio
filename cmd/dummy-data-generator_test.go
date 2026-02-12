@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"testing"
 )
 
@@ -45,10 +44,10 @@ type DummyDataGen struct {
 //
 // Given the function:
 //
-// f := func(r io.Reader) string {
-//           b, _ := ioutil.ReadAll(r)
-//           return string(b)
-// }
+//	f := func(r io.Reader) string {
+//	          b, _ := io.ReadAll(r)
+//	          return string(b)
+//	}
 //
 // for example, the following is true:
 //
@@ -61,11 +60,10 @@ func NewDummyDataGen(totalLength, skipOffset int64) io.ReadSeeker {
 		panic("Negative rotations are not allowed")
 	}
 
-	skipOffset = skipOffset % int64(len(alphabets))
-	as := make([]byte, 2*len(alphabets))
-	copy(as, alphabets)
-	copy(as[len(alphabets):], alphabets)
-	b := as[skipOffset : skipOffset+int64(len(alphabets))]
+	skipOffset %= int64(len(alphabets))
+	const multiply = 100
+	as := bytes.Repeat(alphabets, multiply)
+	b := as[skipOffset : skipOffset+int64(len(alphabets)*(multiply-1))]
 	return &DummyDataGen{
 		length: totalLength,
 		b:      b,
@@ -89,7 +87,7 @@ func (d *DummyDataGen) Read(b []byte) (n int, err error) {
 		}
 		err = io.EOF
 	}
-	return
+	return n, err
 }
 
 func (d *DummyDataGen) Seek(offset int64, whence int) (int64, error) {
@@ -115,7 +113,7 @@ func (d *DummyDataGen) Seek(offset int64, whence int) (int64, error) {
 
 func TestDummyDataGenerator(t *testing.T) {
 	readAll := func(r io.Reader) string {
-		b, _ := ioutil.ReadAll(r)
+		b, _ := io.ReadAll(r)
 		return string(b)
 	}
 	checkEq := func(a, b string) {
@@ -167,7 +165,7 @@ func TestCmpReaders(t *testing.T) {
 		r1 := bytes.NewReader([]byte("abc"))
 		r2 := bytes.NewReader([]byte("abc"))
 		ok, msg := cmpReaders(r1, r2)
-		if !(ok && msg == "") {
+		if !ok || msg != "" {
 			t.Fatalf("unexpected")
 		}
 	}

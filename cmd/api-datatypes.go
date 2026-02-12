@@ -32,6 +32,8 @@ type DeletedObject struct {
 	DeleteMarkerMTime DeleteMarkerMTime `xml:"-"`
 	// MinIO extensions to support delete marker replication
 	ReplicationState ReplicationState `xml:"-"`
+
+	found bool // the object was found during deletion
 }
 
 // DeleteMarkerMTime is an embedded type containing time.Time for XML marshal
@@ -42,16 +44,21 @@ type DeleteMarkerMTime struct {
 // MarshalXML encodes expiration date if it is non-zero and encodes
 // empty string otherwise
 func (t DeleteMarkerMTime) MarshalXML(e *xml.Encoder, startElement xml.StartElement) error {
-	if t.Time.IsZero() {
+	if t.IsZero() {
 		return nil
 	}
-	return e.EncodeElement(t.Time.Format(time.RFC3339), startElement)
+	return e.EncodeElement(t.Format(time.RFC3339), startElement)
+}
+
+// ObjectV object version key/versionId
+type ObjectV struct {
+	ObjectName string `xml:"Key"`
+	VersionID  string `xml:"VersionId"`
 }
 
 // ObjectToDelete carries key name for the object to delete.
 type ObjectToDelete struct {
-	ObjectName string `xml:"Key"`
-	VersionID  string `xml:"VersionId"`
+	ObjectV
 	// Replication status of DeleteMarker
 	DeleteMarkerReplicationStatus string `xml:"DeleteMarkerReplicationStatus"`
 	// Status of versioned delete (of object or DeleteMarker)
@@ -62,7 +69,7 @@ type ObjectToDelete struct {
 	ReplicateDecisionStr string `xml:"-"`
 }
 
-// createBucketConfiguration container for bucket configuration request from client.
+// createBucketLocationConfiguration container for bucket configuration request from client.
 // Used for parsing the location from the request body for Makebucket.
 type createBucketLocationConfiguration struct {
 	XMLName  xml.Name `xml:"CreateBucketConfiguration" json:"-"`

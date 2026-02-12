@@ -18,49 +18,55 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
-	"net/http"
+	"errors"
 	"strings"
+	"time"
 
 	jsoniter "github.com/json-iterator/go"
-	"github.com/minio/minio/internal/hash"
-	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/cachevalue"
 )
 
 const (
 	dataUsageRoot   = SlashSeparator
 	dataUsageBucket = minioMetaBucket + SlashSeparator + bucketMetaPrefix
 
-	dataUsageObjName   = ".usage.json"
+	dataUsageObjName       = ".usage.json"
+	dataUsageObjNamePath   = bucketMetaPrefix + SlashSeparator + dataUsageObjName
+	dataUsageBloomName     = ".bloomcycle.bin"
+	dataUsageBloomNamePath = bucketMetaPrefix + SlashSeparator + dataUsageBloomName
+
+	backgroundHealInfoPath = bucketMetaPrefix + SlashSeparator + ".background-heal.json"
+
 	dataUsageCacheName = ".usage-cache.bin"
-	dataUsageBloomName = ".bloomcycle.bin"
 )
 
-// storeDataUsageInBackend will store all objects sent on the gui channel until closed.
+// storeDataUsageInBackend will store all objects sent on the dui channel until closed.
 func storeDataUsageInBackend(ctx context.Context, objAPI ObjectLayer, dui <-chan DataUsageInfo) {
+	attempts := 1
 	for dataUsageInfo := range dui {
-		var json = jsoniter.ConfigCompatibleWithStandardLibrary
+		json := jsoniter.ConfigCompatibleWithStandardLibrary
 		dataUsageJSON, err := json.Marshal(dataUsageInfo)
 		if err != nil {
-			logger.LogIf(ctx, err)
+			scannerLogIf(ctx, err)
 			continue
 		}
-		size := int64(len(dataUsageJSON))
-		r, err := hash.NewReader(bytes.NewReader(dataUsageJSON), size, "", "", size)
-		if err != nil {
-			logger.LogIf(ctx, err)
-			continue
+		if attempts > 10 {
+			saveConfig(ctx, objAPI, dataUsageObjNamePath+".bkp", dataUsageJSON) // Save a backup every 10th update.
+			attempts = 1
 		}
-		_, err = objAPI.PutObject(ctx, dataUsageBucket, dataUsageObjName, NewPutObjReader(r), ObjectOptions{})
-		if !isErrBucketNotFound(err) {
-			logger.LogIf(ctx, err)
+		if err = saveConfig(ctx, objAPI, dataUsageObjNamePath, dataUsageJSON); err != nil {
+			scannerLogOnceIf(ctx, err, dataUsageObjNamePath)
 		}
+		attempts++
 	}
 }
 
+var prefixUsageCache = cachevalue.New[map[string]uint64]()
+
 // loadPrefixUsageFromBackend returns prefix usages found in passed buckets
-//   e.g.:  /testbucket/prefix => 355601334
+//
+//	e.g.:  /testbucket/prefix => 355601334
 func loadPrefixUsageFromBackend(ctx context.Context, objAPI ObjectLayer, bucket string) (map[string]uint64, error) {
 	z, ok := objAPI.(*erasureServerPools)
 	if !ok {
@@ -70,43 +76,55 @@ func loadPrefixUsageFromBackend(ctx context.Context, objAPI ObjectLayer, bucket 
 
 	cache := dataUsageCache{}
 
-	m := make(map[string]uint64)
-	for _, pool := range z.serverPools {
-		for _, er := range pool.sets {
-			// Load bucket usage prefixes
-			if err := cache.load(ctx, er, bucket+slashSeparator+dataUsageCacheName); err == nil {
-				root := cache.find(bucket)
-				if root == nil {
-					// We dont have usage information for this bucket in this
-					// set, go to the next set
-					continue
-				}
+	prefixUsageCache.InitOnce(30*time.Second,
+		// No need to fail upon Update() error, fallback to old value.
+		cachevalue.Opts{ReturnLastGood: true, NoWait: true},
+		func(ctx context.Context) (map[string]uint64, error) {
+			m := make(map[string]uint64)
+			for _, pool := range z.serverPools {
+				for _, er := range pool.sets {
+					// Load bucket usage prefixes
+					ctx, done := context.WithTimeout(ctx, 2*time.Second)
+					ok := cache.load(ctx, er, bucket+slashSeparator+dataUsageCacheName) == nil
+					done()
+					if ok {
+						root := cache.find(bucket)
+						if root == nil {
+							// We dont have usage information for this bucket in this
+							// set, go to the next set
+							continue
+						}
 
-				for id, usageInfo := range cache.flattenChildrens(*root) {
-					prefix := decodeDirObject(strings.TrimPrefix(id, bucket+slashSeparator))
-					// decodeDirObject to avoid any __XL_DIR__ objects
-					m[prefix] += uint64(usageInfo.Size)
+						for id, usageInfo := range cache.flattenChildrens(*root) {
+							prefix := decodeDirObject(strings.TrimPrefix(id, bucket+slashSeparator))
+							// decodeDirObject to avoid any __XLDIR__ objects
+							m[prefix] += uint64(usageInfo.Size)
+						}
+					}
 				}
 			}
-		}
-	}
+			return m, nil
+		},
+	)
 
-	return m, nil
+	return prefixUsageCache.GetWithCtx(ctx)
 }
 
 func loadDataUsageFromBackend(ctx context.Context, objAPI ObjectLayer) (DataUsageInfo, error) {
-	r, err := objAPI.GetObjectNInfo(ctx, dataUsageBucket, dataUsageObjName, nil, http.Header{}, readLock, ObjectOptions{})
+	buf, err := readConfig(ctx, objAPI, dataUsageObjNamePath)
 	if err != nil {
-		if isErrObjectNotFound(err) || isErrBucketNotFound(err) {
-			return DataUsageInfo{}, nil
+		buf, err = readConfig(ctx, objAPI, dataUsageObjNamePath+".bkp")
+		if err != nil {
+			if errors.Is(err, errConfigNotFound) {
+				return DataUsageInfo{}, nil
+			}
+			return DataUsageInfo{}, toObjectErr(err, minioMetaBucket, dataUsageObjNamePath)
 		}
-		return DataUsageInfo{}, toObjectErr(err, dataUsageBucket, dataUsageObjName)
 	}
-	defer r.Close()
 
 	var dataUsageInfo DataUsageInfo
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
-	if err = json.NewDecoder(r).Decode(&dataUsageInfo); err != nil {
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
+	if err = json.Unmarshal(buf, &dataUsageInfo); err != nil {
 		return DataUsageInfo{}, err
 	}
 	// For forward compatibility reasons, we need to add this code.
@@ -128,17 +146,18 @@ func loadDataUsageFromBackend(ctx context.Context, objAPI ObjectLayer) (DataUsag
 	for bucket, bui := range dataUsageInfo.BucketsUsage {
 		if bui.ReplicatedSizeV1 > 0 || bui.ReplicationFailedCountV1 > 0 ||
 			bui.ReplicationFailedSizeV1 > 0 || bui.ReplicationPendingCountV1 > 0 {
-			dataUsageInfo.ReplicationInfo = make(map[string]BucketTargetUsageInfo)
-			cfg, err := getReplicationConfig(GlobalContext, bucket)
-			if err != nil {
-				return DataUsageInfo{}, err
-			}
-			dataUsageInfo.ReplicationInfo[cfg.RoleArn] = BucketTargetUsageInfo{
-				ReplicationFailedSize:   bui.ReplicationFailedSizeV1,
-				ReplicationFailedCount:  bui.ReplicationFailedCountV1,
-				ReplicatedSize:          bui.ReplicatedSizeV1,
-				ReplicationPendingCount: bui.ReplicationPendingCountV1,
-				ReplicationPendingSize:  bui.ReplicationPendingSizeV1,
+			cfg, _ := getReplicationConfig(GlobalContext, bucket)
+			if cfg != nil && cfg.RoleArn != "" {
+				if dataUsageInfo.ReplicationInfo == nil {
+					dataUsageInfo.ReplicationInfo = make(map[string]BucketTargetUsageInfo)
+				}
+				dataUsageInfo.ReplicationInfo[cfg.RoleArn] = BucketTargetUsageInfo{
+					ReplicationFailedSize:   bui.ReplicationFailedSizeV1,
+					ReplicationFailedCount:  bui.ReplicationFailedCountV1,
+					ReplicatedSize:          bui.ReplicatedSizeV1,
+					ReplicationPendingCount: bui.ReplicationPendingCountV1,
+					ReplicationPendingSize:  bui.ReplicationPendingSizeV1,
+				}
 			}
 		}
 	}

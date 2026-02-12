@@ -23,42 +23,43 @@ import (
 	"errors"
 	"fmt"
 	"go/build"
-	"hash"
-	"net/http"
+	"io"
+	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/minio/highwayhash"
-	"github.com/minio/minio-go/v7/pkg/set"
-	"github.com/minio/minio/internal/logger/message/log"
+	"github.com/minio/madmin-go/v3"
+	"github.com/minio/madmin-go/v3/logger/log"
+	"github.com/minio/minio/internal/color"
+	xhttp "github.com/minio/minio/internal/http"
 )
 
-var (
-	// HighwayHash key for logging in anonymous mode
-	magicHighwayHash256Key = []byte("\x4b\xe7\x34\xfa\x8e\x23\x8a\xcd\x26\x3e\x83\xe6\xbb\x96\x85\x52\x04\x0f\x93\x5d\xa3\x9f\x44\x14\x97\xe0\x9d\x13\x22\xde\x36\xa0")
-	// HighwayHash hasher for logging in anonymous mode
-	loggerHighwayHasher hash.Hash
-)
-
-// Disable disables all logging, false by default. (used for "go test")
-var Disable = false
-
-// Level type
-type Level int8
+// HighwayHash key for logging in anonymous mode
+var magicHighwayHash256Key = []byte("\x4b\xe7\x34\xfa\x8e\x23\x8a\xcd\x26\x3e\x83\xe6\xbb\x96\x85\x52\x04\x0f\x93\x5d\xa3\x9f\x44\x14\x97\xe0\x9d\x13\x22\xde\x36\xa0")
 
 // Enumerated level types
 const (
-	InformationLvl Level = iota + 1
-	ErrorLvl
-	FatalLvl
+	// Log types errors
+	FatalKind   = madmin.LogKindFatal
+	WarningKind = madmin.LogKindWarning
+	ErrorKind   = madmin.LogKindError
+	EventKind   = madmin.LogKindEvent
+	InfoKind    = madmin.LogKindInfo
+)
+
+var (
+	// DisableLog avoids printing error/event/info kind of logs
+	DisableLog = false
+	// Output allows configuring custom writer, defaults to os.Stderr
+	Output io.Writer = os.Stderr
 )
 
 var trimStrings []string
-
-var globalDeploymentID string
 
 // TimeFormat - logging time format.
 const TimeFormat string = "15:04:05 MST 01/02/2006"
@@ -66,38 +67,7 @@ const TimeFormat string = "15:04:05 MST 01/02/2006"
 var matchingFuncNames = [...]string{
 	"http.HandlerFunc.ServeHTTP",
 	"cmd.serverMain",
-	"cmd.StartGateway",
-	"cmd.(*webAPIHandlers).ListBuckets",
-	"cmd.(*webAPIHandlers).MakeBucket",
-	"cmd.(*webAPIHandlers).DeleteBucket",
-	"cmd.(*webAPIHandlers).ListObjects",
-	"cmd.(*webAPIHandlers).RemoveObject",
-	"cmd.(*webAPIHandlers).Login",
-	"cmd.(*webAPIHandlers).SetAuth",
-	"cmd.(*webAPIHandlers).CreateURLToken",
-	"cmd.(*webAPIHandlers).Upload",
-	"cmd.(*webAPIHandlers).Download",
-	"cmd.(*webAPIHandlers).DownloadZip",
-	"cmd.(*webAPIHandlers).GetBucketPolicy",
-	"cmd.(*webAPIHandlers).ListAllBucketPolicies",
-	"cmd.(*webAPIHandlers).SetBucketPolicy",
-	"cmd.(*webAPIHandlers).PresignedGet",
-	"cmd.(*webAPIHandlers).ServerInfo",
-	"cmd.(*webAPIHandlers).StorageInfo",
 	// add more here ..
-}
-
-func (level Level) String() string {
-	var lvlStr string
-	switch level {
-	case InformationLvl:
-		lvlStr = "INFO"
-	case ErrorLvl:
-		lvlStr = "ERROR"
-	case FatalLvl:
-		lvlStr = "FATAL"
-	}
-	return lvlStr
 }
 
 // quietFlag: Hide startup messages if enabled
@@ -105,16 +75,21 @@ func (level Level) String() string {
 var (
 	quietFlag, jsonFlag, anonFlag bool
 	// Custom function to format error
-	errorFmtFunc func(string, error, bool) string
+	// can be registered by RegisterError
+	errorFmtFunc = func(introMsg string, err error, jsonFlag bool) string {
+		return fmt.Sprintf("msg: %s\n err:%s", introMsg, err)
+	}
 )
 
 // EnableQuiet - turns quiet option on.
 func EnableQuiet() {
+	color.TurnOff() // no colored outputs necessary in quiet mode.
 	quietFlag = true
 }
 
 // EnableJSON - outputs logs in json format.
 func EnableJSON() {
+	color.TurnOff() // no colored outputs necessary in JSON mode.
 	jsonFlag = true
 	quietFlag = true
 }
@@ -141,20 +116,32 @@ func RegisterError(f func(string, error, bool) string) {
 	errorFmtFunc = f
 }
 
-// Remove any duplicates and return unique entries.
-func uniqueEntries(paths []string) []string {
-	m := make(set.StringSet)
-	for _, p := range paths {
-		if !m.Contains(p) {
-			m.Add(p)
+// uniq swaps away duplicate elements in data, returning the size of the
+// unique set. data is expected to be pre-sorted, and the resulting set in
+// the range [0:size] will remain in sorted order. Uniq, following a
+// sort.Sort call, can be used to prepare arbitrary inputs for use as sets.
+func uniq(data sort.Interface) (size int) {
+	p, l := 0, data.Len()
+	if l <= 1 {
+		return l
+	}
+	for i := 1; i < l; i++ {
+		if !data.Less(p, i) {
+			continue
+		}
+		p++
+		if p < i {
+			data.Swap(p, i)
 		}
 	}
-	return m.ToSlice()
+	return p + 1
 }
 
-// SetDeploymentID -- Deployment Id from the main package is set here
-func SetDeploymentID(deploymentID string) {
-	globalDeploymentID = deploymentID
+// Remove any duplicates and return unique entries.
+func uniqueEntries(paths []string) []string {
+	sort.Strings(paths)
+	n := uniq(sort.StringSlice(paths))
+	return paths[:n]
 }
 
 // Init sets the trimStrings to possible GOPATHs
@@ -162,22 +149,21 @@ func SetDeploymentID(deploymentID string) {
 // This is done to clean up the filename, when stack trace is
 // displayed when an error happens.
 func Init(goPath string, goRoot string) {
-
 	var goPathList []string
 	var goRootList []string
 	var defaultgoPathList []string
 	var defaultgoRootList []string
-	pathSeperator := ":"
+	pathSeparator := ":"
 	// Add all possible GOPATH paths into trimStrings
 	// Split GOPATH depending on the OS type
 	if runtime.GOOS == "windows" {
-		pathSeperator = ";"
+		pathSeparator = ";"
 	}
 
-	goPathList = strings.Split(goPath, pathSeperator)
-	goRootList = strings.Split(goRoot, pathSeperator)
-	defaultgoPathList = strings.Split(build.Default.GOPATH, pathSeperator)
-	defaultgoRootList = strings.Split(build.Default.GOROOT, pathSeperator)
+	goPathList = strings.Split(goPath, pathSeparator)
+	goRootList = strings.Split(goRoot, pathSeparator)
+	defaultgoPathList = strings.Split(build.Default.GOPATH, pathSeparator)
+	defaultgoRootList = strings.Split(build.Default.GOROOT, pathSeparator)
 
 	// Add trim string "{GOROOT}/src/" into trimStrings
 	trimStrings = []string{filepath.Join(runtime.GOROOT(), "src") + string(filepath.Separator)}
@@ -207,8 +193,6 @@ func Init(goPath string, goRoot string) {
 	// paths like "{GOROOT}/src/github.com/minio/minio"
 	// and "{GOPATH}/src/github.com/minio/minio"
 	trimStrings = append(trimStrings, filepath.Join("github.com", "minio", "minio")+string(filepath.Separator))
-
-	loggerHighwayHasher, _ = highwayhash.New(magicHighwayHash256Key) // New will never return error since key is 256 bit
 }
 
 func trimTrace(f string) string {
@@ -261,127 +245,198 @@ func getTrace(traceLevel int) []string {
 	return trace
 }
 
-// Return the highway hash of the passed string
-func hashString(input string) string {
-	defer loggerHighwayHasher.Reset()
-	loggerHighwayHasher.Write([]byte(input))
-	checksum := loggerHighwayHasher.Sum(nil)
-	return hex.EncodeToString(checksum)
+// HashString - return the highway hash of the passed string
+func HashString(input string) string {
+	hh, _ := highwayhash.New(magicHighwayHash256Key)
+	hh.Write([]byte(input))
+	return hex.EncodeToString(hh.Sum(nil))
 }
-
-// Kind specifies the kind of error log
-type Kind string
-
-const (
-	// Minio errors
-	Minio Kind = "MINIO"
-	// Application errors
-	Application Kind = "APPLICATION"
-	// All errors
-	All Kind = "ALL"
-)
 
 // LogAlwaysIf prints a detailed error message during
 // the execution of the server.
-func LogAlwaysIf(ctx context.Context, err error, errKind ...interface{}) {
+func LogAlwaysIf(ctx context.Context, subsystem string, err error, errKind ...any) {
 	if err == nil {
 		return
 	}
-
-	logIf(ctx, err, errKind...)
+	logIf(ctx, subsystem, err, errKind...)
 }
 
 // LogIf prints a detailed error message during
 // the execution of the server, if it is not an
 // ignored error.
-func LogIf(ctx context.Context, err error, errKind ...interface{}) {
-	if err == nil {
+func LogIf(ctx context.Context, subsystem string, err error, errKind ...any) {
+	if logIgnoreError(err) {
 		return
 	}
-
-	if errors.Is(err, context.Canceled) {
-		return
-	}
-
-	if err.Error() == http.ErrServerClosed.Error() || err.Error() == "disk not found" {
-		return
-	}
-
-	logIf(ctx, err, errKind...)
+	logIf(ctx, subsystem, err, errKind...)
 }
 
-// logIf prints a detailed error message during
-// the execution of the server.
-func logIf(ctx context.Context, err error, errKind ...interface{}) {
-	if Disable {
+// LogIfNot prints a detailed error message during
+// the execution of the server, if it is not an ignored error (either internal or given).
+func LogIfNot(ctx context.Context, subsystem string, err error, ignored ...error) {
+	if logIgnoreError(err) {
 		return
 	}
-	logKind := string(Minio)
-	if len(errKind) > 0 {
-		if ek, ok := errKind[0].(Kind); ok {
-			logKind = string(ek)
+	for _, ignore := range ignored {
+		if errors.Is(err, ignore) {
+			return
 		}
 	}
-	req := GetReqInfo(ctx)
+	logIf(ctx, subsystem, err)
+}
 
-	if req == nil {
-		req = &ReqInfo{API: "SYSTEM"}
+func errToEntry(ctx context.Context, subsystem string, err error, errKind ...any) log.Entry {
+	var l string
+	if anonFlag {
+		l = reflect.TypeOf(err).String()
+	} else {
+		l = fmt.Sprintf("%v (%T)", err, err)
 	}
+	return buildLogEntry(ctx, subsystem, l, getTrace(3), errKind...)
+}
+
+func logToEntry(ctx context.Context, subsystem, message string, errKind ...any) log.Entry {
+	return buildLogEntry(ctx, subsystem, message, nil, errKind...)
+}
+
+func buildLogEntry(ctx context.Context, subsystem, message string, trace []string, errKind ...any) log.Entry {
+	logKind := madmin.LogKindError
+	if len(errKind) > 0 {
+		if ek, ok := errKind[0].(madmin.LogKind); ok {
+			logKind = ek
+		}
+	}
+
+	req := GetReqInfo(ctx)
+	if req == nil {
+		req = &ReqInfo{
+			API:       "SYSTEM",
+			RequestID: fmt.Sprintf("%X", time.Now().UTC().UnixNano()),
+		}
+	}
+	req.RLock()
+	defer req.RUnlock()
 
 	API := "SYSTEM"
-	if req.API != "" {
+	switch {
+	case req.API != "":
 		API = req.API
+	case subsystem != "":
+		API += "." + subsystem
 	}
 
-	kv := req.GetTags()
-	tags := make(map[string]interface{}, len(kv))
-	for _, entry := range kv {
+	// Copy tags. We hold read lock already.
+	tags := make(map[string]any, len(req.tags))
+	for _, entry := range req.tags {
 		tags[entry.Key] = entry.Val
 	}
 
-	// Get full stack trace
-	trace := getTrace(3)
-
 	// Get the cause for the Error
-	message := fmt.Sprintf("%v (%T)", err, err)
+	deploymentID := req.DeploymentID
 	if req.DeploymentID == "" {
-		req.DeploymentID = globalDeploymentID
+		deploymentID = xhttp.GlobalDeploymentID
 	}
+
+	objects := make([]log.ObjectVersion, 0, len(req.Objects))
+	for _, ov := range req.Objects {
+		objects = append(objects, log.ObjectVersion{
+			ObjectName: ov.ObjectName,
+			VersionID:  ov.VersionID,
+		})
+	}
+
 	entry := log.Entry{
-		DeploymentID: req.DeploymentID,
-		Level:        ErrorLvl.String(),
-		LogKind:      logKind,
+		DeploymentID: deploymentID,
+		Level:        logKind,
 		RemoteHost:   req.RemoteHost,
 		Host:         req.Host,
 		RequestID:    req.RequestID,
 		UserAgent:    req.UserAgent,
-		Time:         time.Now().UTC().Format(time.RFC3339Nano),
+		Time:         time.Now().UTC(),
 		API: &log.API{
 			Name: API,
 			Args: &log.Args{
-				Bucket: req.BucketName,
-				Object: req.ObjectName,
+				Bucket:    req.BucketName,
+				Object:    req.ObjectName,
+				VersionID: req.VersionID,
+				Objects:   objects,
 			},
 		},
-		Trace: &log.Trace{
+	}
+
+	if trace != nil {
+		entry.Trace = &log.Trace{
 			Message:   message,
 			Source:    trace,
 			Variables: tags,
-		},
+		}
+	} else {
+		entry.Message = message
 	}
 
 	if anonFlag {
-		entry.API.Args.Bucket = hashString(entry.API.Args.Bucket)
-		entry.API.Args.Object = hashString(entry.API.Args.Object)
-		entry.RemoteHost = hashString(entry.RemoteHost)
-		entry.Trace.Message = reflect.TypeOf(err).String()
-		entry.Trace.Variables = make(map[string]interface{})
+		entry.API.Args.Bucket = HashString(entry.API.Args.Bucket)
+		entry.API.Args.Object = HashString(entry.API.Args.Object)
+		entry.RemoteHost = HashString(entry.RemoteHost)
+		if entry.Trace != nil {
+			entry.Trace.Variables = make(map[string]any)
+		}
+	}
+
+	return entry
+}
+
+// consoleLogIf prints a detailed error message during
+// the execution of the server.
+func consoleLogIf(ctx context.Context, subsystem string, err error, errKind ...any) {
+	if DisableLog {
+		return
+	}
+	if err == nil {
+		return
+	}
+	if consoleTgt != nil {
+		entry := errToEntry(ctx, subsystem, err, errKind...)
+		consoleTgt.Send(ctx, entry)
+	}
+}
+
+// logIf prints a detailed error message during
+// the execution of the server.
+func logIf(ctx context.Context, subsystem string, err error, errKind ...any) {
+	if DisableLog {
+		return
+	}
+	if err == nil {
+		return
+	}
+	entry := errToEntry(ctx, subsystem, err, errKind...)
+	sendLog(ctx, entry)
+}
+
+func sendLog(ctx context.Context, entry log.Entry) {
+	systemTgts := SystemTargets()
+	if len(systemTgts) == 0 {
+		return
 	}
 
 	// Iterate over all logger targets to send the log entry
-	for _, t := range Targets {
-		t.Send(entry, entry.LogKind)
+	for _, t := range systemTgts {
+		if err := t.Send(ctx, entry); err != nil {
+			if consoleTgt != nil { // Sending to the console never fails
+				consoleTgt.Send(ctx, errToEntry(ctx, "logging", fmt.Errorf("unable to send log event to Logger target (%s): %v", t.String(), err), entry.Level))
+			}
+		}
 	}
+}
+
+// Event sends a event log to  log targets
+func Event(ctx context.Context, subsystem, msg string, args ...any) {
+	if DisableLog {
+		return
+	}
+	entry := logToEntry(ctx, subsystem, fmt.Sprintf(msg, args...), EventKind)
+	sendLog(ctx, entry)
 }
 
 // ErrCritical is the value panic'd whenever CriticalIf is called.
@@ -389,15 +444,15 @@ var ErrCritical struct{}
 
 // CriticalIf logs the provided error on the console. It fails the
 // current go-routine by causing a `panic(ErrCritical)`.
-func CriticalIf(ctx context.Context, err error, errKind ...interface{}) {
+func CriticalIf(ctx context.Context, err error, errKind ...any) {
 	if err != nil {
-		LogIf(ctx, err, errKind...)
+		LogIf(ctx, "", err, errKind...)
 		panic(ErrCritical)
 	}
 }
 
 // FatalIf is similar to Fatal() but it ignores passed nil error
-func FatalIf(err error, msg string, data ...interface{}) {
+func FatalIf(err error, msg string, data ...any) {
 	if err == nil {
 		return
 	}

@@ -1,5 +1,5 @@
 /*
- * MinIO Object Storage (c) 2021 MinIO, Inc.
+ * MinIO Object Storage (c) 2021-2023 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v3/net"
 	natsserver "github.com/nats-io/nats-server/v2/test"
 )
 
@@ -31,12 +31,38 @@ func TestNatsConnTLSCustomCA(t *testing.T) {
 
 	clientConfig := &NATSArgs{
 		Enable: true,
-		Address: xnet.Host{Name: "localhost",
+		Address: xnet.Host{
+			Name:      "localhost",
 			Port:      (xnet.Port(opts.Port)),
-			IsPortSet: true},
+			IsPortSet: true,
+		},
 		Subject:       "test",
 		Secure:        true,
 		CertAuthority: path.Join("testdata", "contrib", "certs", "root_ca_cert.pem"),
+	}
+
+	con, err := clientConfig.connectNats()
+	if err != nil {
+		t.Errorf("Could not connect to nats: %v", err)
+	}
+	defer con.Close()
+}
+
+func TestNatsConnTLSCustomCAHandshakeFirst(t *testing.T) {
+	s, opts := natsserver.RunServerWithConfig(filepath.Join("testdata", "contrib", "nats_tls_handshake_first.conf"))
+	defer s.Shutdown()
+
+	clientConfig := &NATSArgs{
+		Enable: true,
+		Address: xnet.Host{
+			Name:      "localhost",
+			Port:      (xnet.Port(opts.Port)),
+			IsPortSet: true,
+		},
+		Subject:           "test",
+		Secure:            true,
+		CertAuthority:     path.Join("testdata", "contrib", "certs", "root_ca_cert.pem"),
+		TLSHandshakeFirst: true,
 	}
 
 	con, err := clientConfig.connectNats()
@@ -52,9 +78,11 @@ func TestNatsConnTLSClientAuthorization(t *testing.T) {
 
 	clientConfig := &NATSArgs{
 		Enable: true,
-		Address: xnet.Host{Name: "localhost",
+		Address: xnet.Host{
+			Name:      "localhost",
 			Port:      (xnet.Port(opts.Port)),
-			IsPortSet: true},
+			IsPortSet: true,
+		},
 		Subject:       "test",
 		Secure:        true,
 		CertAuthority: path.Join("testdata", "contrib", "certs", "root_ca_cert.pem"),

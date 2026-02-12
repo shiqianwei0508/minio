@@ -18,30 +18,31 @@
 package cmd
 
 import (
-	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/v3"
 )
 
 // GetTotalCapacity gets the total capacity in the cluster.
 func GetTotalCapacity(diskInfo []madmin.Disk) (capacity uint64) {
-
 	for _, disk := range diskInfo {
 		capacity += disk.TotalSpace
 	}
-	return
+	return capacity
 }
 
 // GetTotalUsableCapacity gets the total usable capacity in the cluster.
-// This value is not an accurate representation of total usable in a multi-tenant deployment.
-func GetTotalUsableCapacity(diskInfo []madmin.Disk, s StorageInfo) (capacity float64) {
-	raw := GetTotalCapacity(diskInfo)
-	var approxDataBlocks float64
-	var actualDisks float64
-	for _, scData := range s.Backend.StandardSCData {
-		approxDataBlocks += float64(scData)
-		actualDisks += float64(scData + s.Backend.StandardSCParity)
+func GetTotalUsableCapacity(diskInfo []madmin.Disk, s StorageInfo) (capacity uint64) {
+	for _, disk := range diskInfo {
+		// Ignore invalid.
+		if disk.PoolIndex < 0 || len(s.Backend.StandardSCData) <= disk.PoolIndex {
+			// https://github.com/minio/minio/issues/16500
+			continue
+		}
+		// Ignore parity disks
+		if disk.DiskIndex < s.Backend.StandardSCData[disk.PoolIndex] {
+			capacity += disk.TotalSpace
+		}
 	}
-	ratio := approxDataBlocks / actualDisks
-	return float64(raw) * ratio
+	return capacity
 }
 
 // GetTotalCapacityFree gets the total capacity free in the cluster.
@@ -49,19 +50,21 @@ func GetTotalCapacityFree(diskInfo []madmin.Disk) (capacity uint64) {
 	for _, d := range diskInfo {
 		capacity += d.AvailableSpace
 	}
-	return
+	return capacity
 }
 
 // GetTotalUsableCapacityFree gets the total usable capacity free in the cluster.
-// This value is not an accurate representation of total free in a multi-tenant deployment.
-func GetTotalUsableCapacityFree(diskInfo []madmin.Disk, s StorageInfo) (capacity float64) {
-	raw := GetTotalCapacityFree(diskInfo)
-	var approxDataBlocks float64
-	var actualDisks float64
-	for _, scData := range s.Backend.StandardSCData {
-		approxDataBlocks += float64(scData)
-		actualDisks += float64(scData + s.Backend.StandardSCParity)
+func GetTotalUsableCapacityFree(diskInfo []madmin.Disk, s StorageInfo) (capacity uint64) {
+	for _, disk := range diskInfo {
+		// Ignore invalid.
+		if disk.PoolIndex < 0 || len(s.Backend.StandardSCData) <= disk.PoolIndex {
+			// https://github.com/minio/minio/issues/16500
+			continue
+		}
+		// Ignore parity disks
+		if disk.DiskIndex < s.Backend.StandardSCData[disk.PoolIndex] {
+			capacity += disk.AvailableSpace
+		}
 	}
-	ratio := approxDataBlocks / actualDisks
-	return float64(raw) * ratio
+	return capacity
 }

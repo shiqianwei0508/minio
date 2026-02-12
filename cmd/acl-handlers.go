@@ -22,10 +22,10 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/gorilla/mux"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/mux"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // Data types used for returning dummy access control
@@ -80,7 +80,7 @@ func (api objectAPIHandlers) PutBucketACLHandler(w http.ResponseWriter, r *http.
 	}
 
 	// Before proceeding validate if bucket exists.
-	_, err := objAPI.GetBucketInfo(ctx, bucket)
+	_, err := objAPI.GetBucketInfo(ctx, bucket, BucketOptions{})
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -90,8 +90,8 @@ func (api objectAPIHandlers) PutBucketACLHandler(w http.ResponseWriter, r *http.
 	if aclHeader == "" {
 		acl := &accessControlPolicy{}
 		if err = xmlDecoder(r.Body, acl, r.ContentLength); err != nil {
-			if err == io.EOF {
-				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMissingSecurityHeader),
+			if terr, ok := err.(*xml.SyntaxError); ok && terr.Msg == io.EOF.Error() {
+				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMalformedXML),
 					r.URL)
 				return
 			}
@@ -114,8 +114,6 @@ func (api objectAPIHandlers) PutBucketACLHandler(w http.ResponseWriter, r *http.
 		writeErrorResponse(ctx, w, toAPIError(ctx, NotImplemented{}), r.URL)
 		return
 	}
-
-	w.(http.Flusher).Flush()
 }
 
 // GetBucketACLHandler - GET Bucket ACL
@@ -144,7 +142,7 @@ func (api objectAPIHandlers) GetBucketACLHandler(w http.ResponseWriter, r *http.
 	}
 
 	// Before proceeding validate if bucket exists.
-	_, err := objAPI.GetBucketInfo(ctx, bucket)
+	_, err := objAPI.GetBucketInfo(ctx, bucket, BucketOptions{})
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -164,8 +162,6 @@ func (api objectAPIHandlers) GetBucketACLHandler(w http.ResponseWriter, r *http.
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
-
-	w.(http.Flusher).Flush()
 }
 
 // PutObjectACLHandler - PUT Object ACL
@@ -229,8 +225,6 @@ func (api objectAPIHandlers) PutObjectACLHandler(w http.ResponseWriter, r *http.
 		writeErrorResponse(ctx, w, toAPIError(ctx, NotImplemented{}), r.URL)
 		return
 	}
-
-	w.(http.Flusher).Flush()
 }
 
 // GetObjectACLHandler - GET Object ACL
@@ -283,6 +277,4 @@ func (api objectAPIHandlers) GetObjectACLHandler(w http.ResponseWriter, r *http.
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
-
-	w.(http.Flusher).Flush()
 }

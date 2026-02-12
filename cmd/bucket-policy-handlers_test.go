@@ -21,7 +21,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -30,92 +29,105 @@ import (
 	"testing"
 
 	"github.com/minio/minio/internal/auth"
-	"github.com/minio/pkg/bucket/policy"
-	"github.com/minio/pkg/bucket/policy/condition"
+	"github.com/minio/pkg/v3/policy"
+	"github.com/minio/pkg/v3/policy/condition"
 )
 
-func getAnonReadOnlyBucketPolicy(bucketName string) *policy.Policy {
-	return &policy.Policy{
+func getAnonReadOnlyBucketPolicy(bucketName string) *policy.BucketPolicy {
+	return &policy.BucketPolicy{
 		Version: policy.DefaultVersion,
-		Statements: []policy.Statement{policy.NewStatement(
-			policy.Allow,
-			policy.NewPrincipal("*"),
-			policy.NewActionSet(policy.GetBucketLocationAction, policy.ListBucketAction),
-			policy.NewResourceSet(policy.NewResource(bucketName, "")),
-			condition.NewFunctions(),
-		)},
-	}
-}
-
-func getAnonWriteOnlyBucketPolicy(bucketName string) *policy.Policy {
-	return &policy.Policy{
-		Version: policy.DefaultVersion,
-		Statements: []policy.Statement{policy.NewStatement(
-			policy.Allow,
-			policy.NewPrincipal("*"),
-			policy.NewActionSet(
-				policy.GetBucketLocationAction,
-				policy.ListBucketMultipartUploadsAction,
+		Statements: []policy.BPStatement{
+			policy.NewBPStatement(
+				"",
+				policy.Allow,
+				policy.NewPrincipal("*"),
+				policy.NewActionSet(policy.GetBucketLocationAction, policy.ListBucketAction),
+				policy.NewResourceSet(policy.NewResource(bucketName)),
+				condition.NewFunctions(),
 			),
-			policy.NewResourceSet(policy.NewResource(bucketName, "")),
-			condition.NewFunctions(),
-		)},
+		},
 	}
 }
 
-func getAnonReadOnlyObjectPolicy(bucketName, prefix string) *policy.Policy {
-	return &policy.Policy{
+func getAnonWriteOnlyBucketPolicy(bucketName string) *policy.BucketPolicy {
+	return &policy.BucketPolicy{
 		Version: policy.DefaultVersion,
-		Statements: []policy.Statement{policy.NewStatement(
-			policy.Allow,
-			policy.NewPrincipal("*"),
-			policy.NewActionSet(policy.GetObjectAction),
-			policy.NewResourceSet(policy.NewResource(bucketName, prefix)),
-			condition.NewFunctions(),
-		)},
-	}
-}
-
-func getAnonWriteOnlyObjectPolicy(bucketName, prefix string) *policy.Policy {
-	return &policy.Policy{
-		Version: policy.DefaultVersion,
-		Statements: []policy.Statement{policy.NewStatement(
-			policy.Allow,
-			policy.NewPrincipal("*"),
-			policy.NewActionSet(
-				policy.AbortMultipartUploadAction,
-				policy.DeleteObjectAction,
-				policy.ListMultipartUploadPartsAction,
-				policy.PutObjectAction,
+		Statements: []policy.BPStatement{
+			policy.NewBPStatement(
+				"",
+				policy.Allow,
+				policy.NewPrincipal("*"),
+				policy.NewActionSet(
+					policy.GetBucketLocationAction,
+					policy.ListBucketMultipartUploadsAction,
+				),
+				policy.NewResourceSet(policy.NewResource(bucketName)),
+				condition.NewFunctions(),
 			),
-			policy.NewResourceSet(policy.NewResource(bucketName, prefix)),
-			condition.NewFunctions(),
-		)},
+		},
+	}
+}
+
+func getAnonReadOnlyObjectPolicy(bucketName, prefix string) *policy.BucketPolicy {
+	return &policy.BucketPolicy{
+		Version: policy.DefaultVersion,
+		Statements: []policy.BPStatement{
+			policy.NewBPStatement(
+				"",
+				policy.Allow,
+				policy.NewPrincipal("*"),
+				policy.NewActionSet(policy.GetObjectAction),
+				policy.NewResourceSet(policy.NewResource(bucketName+"/"+prefix)),
+				condition.NewFunctions(),
+			),
+		},
+	}
+}
+
+func getAnonWriteOnlyObjectPolicy(bucketName, prefix string) *policy.BucketPolicy {
+	return &policy.BucketPolicy{
+		Version: policy.DefaultVersion,
+		Statements: []policy.BPStatement{
+			policy.NewBPStatement(
+				"",
+				policy.Allow,
+				policy.NewPrincipal("*"),
+				policy.NewActionSet(
+					policy.AbortMultipartUploadAction,
+					policy.DeleteObjectAction,
+					policy.ListMultipartUploadPartsAction,
+					policy.PutObjectAction,
+				),
+				policy.NewResourceSet(policy.NewResource(bucketName+"/"+prefix)),
+				condition.NewFunctions(),
+			),
+		},
 	}
 }
 
 // Wrapper for calling Create Bucket and ensure we get one and only one success.
 func TestCreateBucket(t *testing.T) {
-	ExecObjectLayerAPITest(t, testCreateBucket, []string{"MakeBucketWithLocation"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testCreateBucket, endpoints: []string{"MakeBucket"}})
 }
 
 // testCreateBucket - Test for calling Create Bucket and ensure we get one and only one success.
 func testCreateBucket(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
-	credentials auth.Credentials, t *testing.T) {
+	credentials auth.Credentials, t *testing.T,
+) {
 	bucketName1 := fmt.Sprintf("%s-1", bucketName)
 
 	const n = 100
-	var start = make(chan struct{})
+	start := make(chan struct{})
 	var ok, errs int
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	wg.Add(n)
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			defer wg.Done()
 			// Sync start.
 			<-start
-			if err := obj.MakeBucketWithLocation(GlobalContext, bucketName1, BucketOptions{}); err != nil {
+			if err := obj.MakeBucket(GlobalContext, bucketName1, MakeBucketOptions{}); err != nil {
 				if _, ok := err.(BucketExists); !ok {
 					t.Logf("unexpected error: %T: %v", err, err)
 					return
@@ -142,15 +154,15 @@ func testCreateBucket(obj ObjectLayer, instanceType, bucketName string, apiRoute
 
 // Wrapper for calling Put Bucket Policy HTTP handler tests for both Erasure multiple disks and single node setup.
 func TestPutBucketPolicyHandler(t *testing.T) {
-	ExecObjectLayerAPITest(t, testPutBucketPolicyHandler, []string{"PutBucketPolicy"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testPutBucketPolicyHandler, endpoints: []string{"PutBucketPolicy"}})
 }
 
 // testPutBucketPolicyHandler - Test for Bucket policy end point.
 func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
-	credentials auth.Credentials, t *testing.T) {
-
+	credentials auth.Credentials, t *testing.T,
+) {
 	bucketName1 := fmt.Sprintf("%s-1", bucketName)
-	if err := obj.MakeBucketWithLocation(GlobalContext, bucketName1, BucketOptions{}); err != nil {
+	if err := obj.MakeBucket(GlobalContext, bucketName1, MakeBucketOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -175,7 +187,7 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		// Test case - 1.
 		{
 			bucketName:         bucketName,
-			bucketPolicyReader: bytes.NewReader([]byte(fmt.Sprintf(bucketPolicyTemplate, bucketName, bucketName))),
+			bucketPolicyReader: bytes.NewReader(fmt.Appendf(nil, bucketPolicyTemplate, bucketName, bucketName)),
 
 			policyLen:          len(fmt.Sprintf(bucketPolicyTemplate, bucketName, bucketName)),
 			accessKey:          credentials.AccessKey,
@@ -187,7 +199,7 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		// Expecting StatusBadRequest (400).
 		{
 			bucketName:         bucketName,
-			bucketPolicyReader: bytes.NewReader([]byte(fmt.Sprintf(bucketPolicyTemplate, bucketName, bucketName))),
+			bucketPolicyReader: bytes.NewReader(fmt.Appendf(nil, bucketPolicyTemplate, bucketName, bucketName)),
 
 			policyLen:          maxBucketPolicySize + 1,
 			accessKey:          credentials.AccessKey,
@@ -199,7 +211,7 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		// Expecting the HTTP response status to be StatusLengthRequired (411).
 		{
 			bucketName:         bucketName,
-			bucketPolicyReader: bytes.NewReader([]byte(fmt.Sprintf(bucketPolicyTemplate, bucketName, bucketName))),
+			bucketPolicyReader: bytes.NewReader(fmt.Appendf(nil, bucketPolicyTemplate, bucketName, bucketName)),
 
 			policyLen:          0,
 			accessKey:          credentials.AccessKey,
@@ -246,7 +258,7 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		// checkBucketPolicyResources should fail.
 		{
 			bucketName:         bucketName1,
-			bucketPolicyReader: bytes.NewReader([]byte(fmt.Sprintf(bucketPolicyTemplate, bucketName, bucketName))),
+			bucketPolicyReader: bytes.NewReader(fmt.Appendf(nil, bucketPolicyTemplate, bucketName, bucketName)),
 
 			policyLen:          len(fmt.Sprintf(bucketPolicyTemplate, bucketName, bucketName)),
 			accessKey:          credentials.AccessKey,
@@ -259,7 +271,7 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		// should result in 404 StatusNotFound
 		{
 			bucketName:         "non-existent-bucket",
-			bucketPolicyReader: bytes.NewReader([]byte(fmt.Sprintf(bucketPolicyTemplate, "non-existent-bucket", "non-existent-bucket"))),
+			bucketPolicyReader: bytes.NewReader(fmt.Appendf(nil, bucketPolicyTemplate, "non-existent-bucket", "non-existent-bucket")),
 
 			policyLen:          len(fmt.Sprintf(bucketPolicyTemplate, bucketName, bucketName)),
 			accessKey:          credentials.AccessKey,
@@ -272,12 +284,12 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		// should result in 404 StatusNotFound
 		{
 			bucketName:         ".invalid-bucket",
-			bucketPolicyReader: bytes.NewReader([]byte(fmt.Sprintf(bucketPolicyTemplate, ".invalid-bucket", ".invalid-bucket"))),
+			bucketPolicyReader: bytes.NewReader(fmt.Appendf(nil, bucketPolicyTemplate, ".invalid-bucket", ".invalid-bucket")),
 
 			policyLen:          len(fmt.Sprintf(bucketPolicyTemplate, bucketName, bucketName)),
 			accessKey:          credentials.AccessKey,
 			secretKey:          credentials.SecretKey,
-			expectedRespStatus: http.StatusNotFound,
+			expectedRespStatus: http.StatusBadRequest,
 		},
 		// Test case - 10.
 		// Existent bucket with policy with Version field empty.
@@ -285,7 +297,7 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		// should result in 400 StatusBadRequest.
 		{
 			bucketName:         bucketName,
-			bucketPolicyReader: bytes.NewReader([]byte(fmt.Sprintf(bucketPolicyTemplateWithoutVersion, bucketName, bucketName))),
+			bucketPolicyReader: bytes.NewReader(fmt.Appendf(nil, bucketPolicyTemplateWithoutVersion, bucketName, bucketName)),
 
 			policyLen:          len(fmt.Sprintf(bucketPolicyTemplateWithoutVersion, bucketName, bucketName)),
 			accessKey:          credentials.AccessKey,
@@ -305,7 +317,7 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		if err != nil {
 			t.Fatalf("Test %d: %s: Failed to create HTTP request for PutBucketPolicyHandler: <ERROR> %v", i+1, instanceType, err)
 		}
-		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic ofthe handler.
+		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic of the handler.
 		// Call the ServeHTTP to execute the handler.
 		apiRouter.ServeHTTP(recV4, reqV4)
 		if recV4.Code != testCase.expectedRespStatus {
@@ -319,7 +331,7 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		if err != nil {
 			t.Fatalf("Test %d: %s: Failed to create HTTP request for PutBucketPolicyHandler: <ERROR> %v", i+1, instanceType, err)
 		}
-		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic ofthe handler.
+		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic of the handler.
 		// Call the ServeHTTP to execute the handler.
 		apiRouter.ServeHTTP(recV2, reqV2)
 		if recV2.Code != testCase.expectedRespStatus {
@@ -333,7 +345,6 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 	// create unsigned HTTP request for PutBucketPolicyHandler.
 	anonReq, err := newTestRequest(http.MethodPut, getPutPolicyURL("", bucketName),
 		int64(len(bucketPolicyStr)), bytes.NewReader([]byte(bucketPolicyStr)))
-
 	if err != nil {
 		t.Fatalf("MinIO %s: Failed to create an anonymous request for bucket \"%s\": <ERROR> %v",
 			instanceType, bucketName, err)
@@ -352,24 +363,23 @@ func testPutBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 
 	nilReq, err := newTestSignedRequestV4(http.MethodPut, getPutPolicyURL("", nilBucket),
 		0, nil, "", "", nil)
-
 	if err != nil {
 		t.Errorf("MinIO %s: Failed to create HTTP request for testing the response when object Layer is set to `nil`.", instanceType)
 	}
 	// execute the object layer set to `nil` test.
 	// `ExecObjectLayerAPINilTest` manages the operation.
 	ExecObjectLayerAPINilTest(t, nilBucket, "", instanceType, apiRouter, nilReq)
-
 }
 
 // Wrapper for calling Get Bucket Policy HTTP handler tests for both Erasure multiple disks and single node setup.
 func TestGetBucketPolicyHandler(t *testing.T) {
-	ExecObjectLayerAPITest(t, testGetBucketPolicyHandler, []string{"PutBucketPolicy", "GetBucketPolicy"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testGetBucketPolicyHandler, endpoints: []string{"PutBucketPolicy", "GetBucketPolicy"}})
 }
 
 // testGetBucketPolicyHandler - Test for end point which fetches the access policy json of the given bucket.
 func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
-	credentials auth.Credentials, t *testing.T) {
+	credentials auth.Credentials, t *testing.T,
+) {
 	// template for constructing HTTP request body for PUT bucket policy.
 	bucketPolicyTemplate := `{"Version":"2012-10-17","Statement":[{"Action":["s3:GetBucketLocation","s3:ListBucket"],"Effect":"Allow","Principal":{"AWS":["*"]},"Resource":["arn:aws:s3:::%s"]},{"Action":["s3:GetObject"],"Effect":"Allow","Principal":{"AWS":["*"]},"Resource":["arn:aws:s3:::%s/this*"]}]}`
 
@@ -397,7 +407,7 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		if err != nil {
 			t.Fatalf("Test %d: Failed to create HTTP request for PutBucketPolicyHandler: <ERROR> %v", i+1, err)
 		}
-		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic ofthe handler.
+		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic of the handler.
 		// Call the ServeHTTP to execute the handler.
 		apiRouter.ServeHTTP(recV4, reqV4)
 		if recV4.Code != testPolicy.expectedRespStatus {
@@ -411,7 +421,7 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		if err != nil {
 			t.Fatalf("Test %d: Failed to create HTTP request for PutBucketPolicyHandler: <ERROR> %v", i+1, err)
 		}
-		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic ofthe handler.
+		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic of the handler.
 		// Call the ServeHTTP to execute the handler.
 		apiRouter.ServeHTTP(recV2, reqV2)
 		if recV2.Code != testPolicy.expectedRespStatus {
@@ -453,7 +463,7 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 			accessKey:            credentials.AccessKey,
 			secretKey:            credentials.SecretKey,
 			expectedBucketPolicy: "",
-			expectedRespStatus:   http.StatusNotFound,
+			expectedRespStatus:   http.StatusBadRequest,
 		},
 	}
 	// Iterating over the cases, fetching the policy and validating the response.
@@ -465,7 +475,6 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 		// construct HTTP request for PUT bucket policy endpoint.
 		reqV4, err := newTestSignedRequestV4(http.MethodGet, getGetPolicyURL("", testCase.bucketName),
 			0, nil, testCase.accessKey, testCase.secretKey, nil)
-
 		if err != nil {
 			t.Fatalf("Test %d: Failed to create HTTP request for GetBucketPolicyHandler: <ERROR> %v", i+1, err)
 		}
@@ -477,20 +486,20 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 			t.Fatalf("Case %d: Expected the response status to be `%d`, but instead found `%d`", i+1, testCase.expectedRespStatus, recV4.Code)
 		}
 		// read the response body.
-		bucketPolicyReadBuf, err := ioutil.ReadAll(recV4.Body)
+		bucketPolicyReadBuf, err := io.ReadAll(recV4.Body)
 		if err != nil {
 			t.Fatalf("Test %d: %s: Failed parsing response body: <ERROR> %v", i+1, instanceType, err)
 		}
 
 		if recV4.Code != testCase.expectedRespStatus {
 			// Verify whether the bucket policy fetched is same as the one inserted.
-			var expectedPolicy *policy.Policy
-			expectedPolicy, err = policy.ParseConfig(strings.NewReader(expectedBucketPolicyStr), testCase.bucketName)
+			var expectedPolicy *policy.BucketPolicy
+			expectedPolicy, err = policy.ParseBucketPolicyConfig(strings.NewReader(expectedBucketPolicyStr), testCase.bucketName)
 			if err != nil {
 				t.Fatalf("unexpected error. %v", err)
 			}
-			var gotPolicy *policy.Policy
-			gotPolicy, err = policy.ParseConfig(bytes.NewReader(bucketPolicyReadBuf), testCase.bucketName)
+			var gotPolicy *policy.BucketPolicy
+			gotPolicy, err = policy.ParseBucketPolicyConfig(bytes.NewReader(bucketPolicyReadBuf), testCase.bucketName)
 			if err != nil {
 				t.Fatalf("unexpected error. %v", err)
 			}
@@ -515,17 +524,17 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 			t.Fatalf("Case %d: Expected the response status to be `%d`, but instead found `%d`", i+1, testCase.expectedRespStatus, recV2.Code)
 		}
 		// read the response body.
-		bucketPolicyReadBuf, err = ioutil.ReadAll(recV2.Body)
+		bucketPolicyReadBuf, err = io.ReadAll(recV2.Body)
 		if err != nil {
 			t.Fatalf("Test %d: %s: Failed parsing response body: <ERROR> %v", i+1, instanceType, err)
 		}
 		if recV2.Code == http.StatusOK {
 			// Verify whether the bucket policy fetched is same as the one inserted.
-			expectedPolicy, err := policy.ParseConfig(strings.NewReader(expectedBucketPolicyStr), testCase.bucketName)
+			expectedPolicy, err := policy.ParseBucketPolicyConfig(strings.NewReader(expectedBucketPolicyStr), testCase.bucketName)
 			if err != nil {
 				t.Fatalf("unexpected error. %v", err)
 			}
-			gotPolicy, err := policy.ParseConfig(bytes.NewReader(bucketPolicyReadBuf), testCase.bucketName)
+			gotPolicy, err := policy.ParseBucketPolicyConfig(bytes.NewReader(bucketPolicyReadBuf), testCase.bucketName)
 			if err != nil {
 				t.Fatalf("unexpected error. %v", err)
 			}
@@ -540,7 +549,6 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 	// Bucket policy related functions doesn't support anonymous requests, setting policies shouldn't make a difference.
 	// create unsigned HTTP request for PutBucketPolicyHandler.
 	anonReq, err := newTestRequest(http.MethodGet, getPutPolicyURL("", bucketName), 0, nil)
-
 	if err != nil {
 		t.Fatalf("MinIO %s: Failed to create an anonymous request for bucket \"%s\": <ERROR> %v",
 			instanceType, bucketName, err)
@@ -559,7 +567,6 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 
 	nilReq, err := newTestSignedRequestV4(http.MethodGet, getGetPolicyURL("", nilBucket),
 		0, nil, "", "", nil)
-
 	if err != nil {
 		t.Errorf("MinIO %s: Failed to create HTTP request for testing the response when object Layer is set to `nil`.", instanceType)
 	}
@@ -570,13 +577,13 @@ func testGetBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string
 
 // Wrapper for calling Delete Bucket Policy HTTP handler tests for both Erasure multiple disks and single node setup.
 func TestDeleteBucketPolicyHandler(t *testing.T) {
-	ExecObjectLayerAPITest(t, testDeleteBucketPolicyHandler, []string{"PutBucketPolicy", "DeleteBucketPolicy"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testDeleteBucketPolicyHandler, endpoints: []string{"PutBucketPolicy", "DeleteBucketPolicy"}})
 }
 
 // testDeleteBucketPolicyHandler - Test for Delete bucket policy end point.
 func testDeleteBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
-	credentials auth.Credentials, t *testing.T) {
-
+	credentials auth.Credentials, t *testing.T,
+) {
 	// template for constructing HTTP request body for PUT bucket policy.
 	bucketPolicyTemplate := `{
     "Version": "2012-10-17",
@@ -679,7 +686,7 @@ func testDeleteBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName str
 			bucketName:         ".invalid-bucket-name",
 			accessKey:          credentials.AccessKey,
 			secretKey:          credentials.SecretKey,
-			expectedRespStatus: http.StatusNotFound,
+			expectedRespStatus: http.StatusBadRequest,
 		},
 	}
 	// Iterating over the cases and deleting the bucket policy and then asserting response.
@@ -743,7 +750,6 @@ func testDeleteBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName str
 	// Bucket policy related functions doesn't support anonymous requests, setting policies shouldn't make a difference.
 	// create unsigned HTTP request for PutBucketPolicyHandler.
 	anonReq, err := newTestRequest(http.MethodDelete, getPutPolicyURL("", bucketName), 0, nil)
-
 	if err != nil {
 		t.Fatalf("MinIO %s: Failed to create an anonymous request for bucket \"%s\": <ERROR> %v",
 			instanceType, bucketName, err)
@@ -762,7 +768,6 @@ func testDeleteBucketPolicyHandler(obj ObjectLayer, instanceType, bucketName str
 
 	nilReq, err := newTestSignedRequestV4(http.MethodDelete, getDeletePolicyURL("", nilBucket),
 		0, nil, "", "", nil)
-
 	if err != nil {
 		t.Errorf("MinIO %s: Failed to create HTTP request for testing the response when object Layer is set to `nil`.", instanceType)
 	}

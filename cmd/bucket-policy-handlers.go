@@ -18,14 +18,16 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 
 	humanize "github.com/dustin/go-humanize"
-	"github.com/gorilla/mux"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/mux"
+	"github.com/minio/pkg/v3/policy"
 )
 
 const (
@@ -58,7 +60,7 @@ func (api objectAPIHandlers) PutBucketPolicyHandler(w http.ResponseWriter, r *ht
 	}
 
 	// Check if bucket exists.
-	if _, err := objAPI.GetBucketInfo(ctx, bucket); err != nil {
+	if _, err := objAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -76,15 +78,25 @@ func (api objectAPIHandlers) PutBucketPolicyHandler(w http.ResponseWriter, r *ht
 		return
 	}
 
-	bucketPolicy, err := policy.ParseConfig(io.LimitReader(r.Body, r.ContentLength), bucket)
+	bucketPolicyBytes, err := io.ReadAll(io.LimitReader(r.Body, r.ContentLength))
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
 
+	bucketPolicy, err := policy.ParseBucketPolicyConfig(bytes.NewReader(bucketPolicyBytes), bucket)
+	if err != nil {
+		writeErrorResponse(ctx, w, APIError{
+			Code:           "MalformedPolicy",
+			HTTPStatusCode: http.StatusBadRequest,
+			Description:    err.Error(),
+		}, r.URL)
+		return
+	}
+
 	// Version in policy must not be empty
 	if bucketPolicy.Version == "" {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMalformedPolicy), r.URL)
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrPolicyInvalidVersion), r.URL)
 		return
 	}
 
@@ -94,10 +106,19 @@ func (api objectAPIHandlers) PutBucketPolicyHandler(w http.ResponseWriter, r *ht
 		return
 	}
 
-	if err = globalBucketMetadataSys.Update(bucket, bucketPolicyConfig, configData); err != nil {
+	updatedAt, err := globalBucketMetadataSys.Update(ctx, bucket, bucketPolicyConfig, configData)
+	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
+
+	// Call site replication hook.
+	replLogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
+		Type:      madmin.SRBucketMetaTypePolicy,
+		Bucket:    bucket,
+		Policy:    bucketPolicyBytes,
+		UpdatedAt: updatedAt,
+	}))
 
 	// Success.
 	writeSuccessNoContent(w)
@@ -124,15 +145,23 @@ func (api objectAPIHandlers) DeleteBucketPolicyHandler(w http.ResponseWriter, r 
 	}
 
 	// Check if bucket exists.
-	if _, err := objAPI.GetBucketInfo(ctx, bucket); err != nil {
+	if _, err := objAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
 
-	if err := globalBucketMetadataSys.Update(bucket, bucketPolicyConfig, nil); err != nil {
+	updatedAt, err := globalBucketMetadataSys.Delete(ctx, bucket, bucketPolicyConfig)
+	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
+
+	// Call site replication hook.
+	replLogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
+		Type:      madmin.SRBucketMetaTypePolicy,
+		Bucket:    bucket,
+		UpdatedAt: updatedAt,
+	}))
 
 	// Success.
 	writeSuccessNoContent(w)
@@ -159,7 +188,7 @@ func (api objectAPIHandlers) GetBucketPolicyHandler(w http.ResponseWriter, r *ht
 	}
 
 	// Check if bucket exists.
-	if _, err := objAPI.GetBucketInfo(ctx, bucket); err != nil {
+	if _, err := objAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}

@@ -22,13 +22,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/bcicen/jstream"
+	"github.com/minio/minio/internal/s3select/jstream"
 	"github.com/minio/simdjson-go"
 )
 
-var (
-	errBadLimitSpecified = errors.New("Limit value must be a positive integer")
-)
+var errBadLimitSpecified = errors.New("Limit value must be a positive integer")
 
 const (
 	baseTableName = "s3object"
@@ -59,7 +57,7 @@ func ParseSelectStatement(s string) (stmt SelectStatement, err error) {
 	err = SQLParser.ParseString(s, &selectAST)
 	if err != nil {
 		err = errQueryParseFailure(err)
-		return
+		return stmt, err
 	}
 
 	// Check if select is "SELECT s.* from S3Object s"
@@ -82,7 +80,7 @@ func ParseSelectStatement(s string) (stmt SelectStatement, err error) {
 	stmt.limitValue, err = parseLimit(selectAST.Limit)
 	if err != nil {
 		err = errQueryAnalysisFailure(err)
-		return
+		return stmt, err
 	}
 
 	// Analyze where clause
@@ -90,19 +88,19 @@ func ParseSelectStatement(s string) (stmt SelectStatement, err error) {
 		whereQProp := selectAST.Where.analyze(&selectAST)
 		if whereQProp.err != nil {
 			err = errQueryAnalysisFailure(fmt.Errorf("Where clause error: %w", whereQProp.err))
-			return
+			return stmt, err
 		}
 
 		if whereQProp.isAggregation {
 			err = errQueryAnalysisFailure(errors.New("WHERE clause cannot have an aggregation"))
-			return
+			return stmt, err
 		}
 	}
 
 	// Validate table name
 	err = validateTableName(selectAST.From)
 	if err != nil {
-		return
+		return stmt, err
 	}
 
 	// Analyze main select expression
@@ -114,11 +112,19 @@ func ParseSelectStatement(s string) (stmt SelectStatement, err error) {
 
 	// Set table alias
 	stmt.tableAlias = selectAST.From.As
-	return
+	// Remove quotes from column aliases
+	if selectAST.Expression != nil {
+		for _, exp := range selectAST.Expression.Expressions {
+			if strings.HasSuffix(exp.As, "'") && strings.HasPrefix(exp.As, "'") && len(exp.As) >= 2 {
+				exp.As = exp.As[1 : len(exp.As)-1]
+			}
+		}
+	}
+	return stmt, err
 }
 
 func validateTableName(from *TableExpression) error {
-	if strings.ToLower(from.Table.BaseKey.String()) != baseTableName {
+	if !strings.EqualFold(from.Table.BaseKey.String(), baseTableName) {
 		return errBadTableName(errors.New("table name must be `s3object`"))
 	}
 
@@ -168,7 +174,7 @@ func (e *SelectStatement) EvalFrom(format string, input Record) ([]*Record, erro
 		case jstream.KVS:
 			kvs = v
 
-		case []interface{}:
+		case []any:
 			recs := make([]*Record, len(v))
 			for i, val := range v {
 				tmpRec := input.Clone(nil)
@@ -201,7 +207,7 @@ func (e *SelectStatement) EvalFrom(format string, input Record) ([]*Record, erro
 				return nil, err
 			}
 
-		case []interface{}:
+		case []any:
 			recs := make([]*Record, len(v))
 			for i, val := range v {
 				tmpRec := input.Clone(nil)
@@ -302,9 +308,8 @@ func (e *SelectStatement) Eval(input, output Record) (Record, error) {
 		// .. WHERE ..`
 
 		// Update count of records output.
-		if e.limitValue > -1 {
-			e.outputCount++
-		}
+		e.outputCount++
+
 		return input.Clone(output), nil
 	}
 
@@ -328,9 +333,7 @@ func (e *SelectStatement) Eval(input, output Record) (Record, error) {
 	}
 
 	// Update count of records output.
-	if e.limitValue > -1 {
-		e.outputCount++
-	}
+	e.outputCount++
 
 	return output, nil
 }

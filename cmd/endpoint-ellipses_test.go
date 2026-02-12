@@ -22,7 +22,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/minio/pkg/ellipses"
+	"github.com/minio/pkg/v3/ellipses"
 )
 
 // Tests create endpoints with ellipses and without.
@@ -54,15 +54,19 @@ func TestCreateServerEndpoints(t *testing.T) {
 		{":9001", []string{"http://localhost:9001/export{01...64}"}, true},
 	}
 
-	for _, testCase := range testCases {
-		testCase := testCase
+	for i, testCase := range testCases {
 		t.Run("", func(t *testing.T) {
-			_, _, err := createServerEndpoints(testCase.serverAddr, testCase.args...)
+			srvCtxt := serverCtxt{}
+			err := mergeDisksLayoutFromArgs(testCase.args, &srvCtxt)
 			if err != nil && testCase.success {
-				t.Errorf("Expected success but failed instead %s", err)
+				t.Fatalf("Test %d: unexpected error: %v", i+1, err)
+			}
+			_, _, err = createServerEndpoints(testCase.serverAddr, srvCtxt.Layout.pools, srvCtxt.Layout.legacy)
+			if err != nil && testCase.success {
+				t.Errorf("Test %d: Expected success but failed instead %s", i+1, err)
 			}
 			if err == nil && !testCase.success {
-				t.Errorf("Expected failure but passed instead")
+				t.Errorf("Test %d: Expected failure but passed instead", i+1)
 			}
 		})
 	}
@@ -72,14 +76,14 @@ func TestGetDivisibleSize(t *testing.T) {
 	testCases := []struct {
 		totalSizes []uint64
 		result     uint64
-	}{{[]uint64{24, 32, 16}, 8},
+	}{
+		{[]uint64{24, 32, 16}, 8},
 		{[]uint64{32, 8, 4}, 4},
 		{[]uint64{8, 8, 8}, 8},
 		{[]uint64{24}, 24},
 	}
 
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run("", func(t *testing.T) {
 			gotGCD := getDivisibleSize(testCase.totalSizes)
 			if testCase.result != gotGCD {
@@ -166,9 +170,8 @@ func TestGetSetIndexesEnvOverride(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run("", func(t *testing.T) {
-			var argPatterns = make([]ellipses.ArgPattern, len(testCase.args))
+			argPatterns := make([]ellipses.ArgPattern, len(testCase.args))
 			for i, arg := range testCase.args {
 				patterns, err := ellipses.FindEllipsesPatterns(arg)
 				if err != nil {
@@ -201,24 +204,24 @@ func TestGetSetIndexes(t *testing.T) {
 	}{
 		// Invalid inputs.
 		{
-			[]string{"data{1...3}"},
-			[]uint64{3},
-			nil,
-			false,
-		},
-		{
-			[]string{"data/controller1/export{1...2}, data/controller2/export{1...4}, data/controller3/export{1...8}"},
-			[]uint64{2, 4, 8},
-			nil,
-			false,
-		},
-		{
 			[]string{"data{1...17}/export{1...52}"},
 			[]uint64{14144},
 			nil,
 			false,
 		},
 		// Valid inputs.
+		{
+			[]string{"data{1...3}"},
+			[]uint64{3},
+			[][]uint64{{3}},
+			true,
+		},
+		{
+			[]string{"data/controller1/export{1...2}, data/controller2/export{1...4}, data/controller3/export{1...8}"},
+			[]uint64{2, 4, 8},
+			[][]uint64{{2}, {2, 2}, {2, 2, 2, 2}},
+			true,
+		},
 		{
 			[]string{"data{1...27}"},
 			[]uint64{27},
@@ -288,9 +291,8 @@ func TestGetSetIndexes(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run("", func(t *testing.T) {
-			var argPatterns = make([]ellipses.ArgPattern, len(testCase.args))
+			argPatterns := make([]ellipses.ArgPattern, len(testCase.args))
 			for i, arg := range testCase.args {
 				patterns, err := ellipses.FindEllipsesPatterns(arg)
 				if err != nil {
@@ -552,8 +554,10 @@ func TestParseEndpointSet(t *testing.T) {
 					},
 				},
 				nil,
-				[][]uint64{{16, 16, 16, 16, 16, 16, 16, 16,
-					16, 16, 16, 16, 16, 16, 16, 16}},
+				[][]uint64{{
+					16, 16, 16, 16, 16, 16, 16, 16,
+					16, 16, 16, 16, 16, 16, 16, 16,
+				}},
 			},
 			true,
 		},
@@ -629,7 +633,6 @@ func TestParseEndpointSet(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run("", func(t *testing.T) {
 			gotEs, err := parseEndpointSet(0, testCase.arg)
 			if err != nil && testCase.success {

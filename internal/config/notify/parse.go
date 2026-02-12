@@ -22,6 +22,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -31,345 +32,242 @@ import (
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/event/target"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/env"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/pkg/v3/env"
+	xnet "github.com/minio/pkg/v3/net"
+	"github.com/rabbitmq/amqp091-go"
 )
 
 const (
 	formatNamespace = "namespace"
 )
 
+const (
+	logSubsys = "notify"
+)
+
+func logOnceIf(ctx context.Context, err error, id string, errKind ...any) {
+	logger.LogOnceIf(ctx, logSubsys, err, id, errKind...)
+}
+
 // ErrTargetsOffline - Indicates single/multiple target failures.
 var ErrTargetsOffline = errors.New("one or more targets are offline. Please use `mc admin info --json` to check the offline targets")
 
-// TestNotificationTargets is similar to GetNotificationTargets()
-// avoids explicit registration.
-func TestNotificationTargets(ctx context.Context, cfg config.Config, transport *http.Transport, targetIDs []event.TargetID) error {
-	test := true
-	returnOnTargetError := true
-	targets, err := RegisterNotificationTargets(ctx, cfg, transport, targetIDs, test, returnOnTargetError)
-	if err == nil {
-		// Close all targets since we are only testing connections.
-		for _, t := range targets.TargetMap() {
-			_ = t.Close()
+// TestSubSysNotificationTargets - tests notification targets of given subsystem
+func TestSubSysNotificationTargets(ctx context.Context, cfg config.Config, subSys string, transport *http.Transport) error {
+	if err := checkValidNotificationKeysForSubSys(subSys, cfg[subSys]); err != nil {
+		return err
+	}
+
+	targetList, err := fetchSubSysTargets(ctx, cfg, subSys, transport)
+	if err != nil {
+		return err
+	}
+
+	for _, target := range targetList {
+		defer target.Close()
+	}
+
+	tgts, ok := ctx.Value(config.ContextKeyForTargetFromConfig).(map[string]bool)
+	if !ok {
+		tgts = make(map[string]bool)
+	}
+	for _, target := range targetList {
+		if tgts[target.ID().ID] {
+			// When target set should be online
+			yes, err := target.IsActive()
+			if err == nil && !yes {
+				err = ErrTargetsOffline
+			}
+			if err != nil {
+				return fmt.Errorf("error (%s): %w", target.ID(), err)
+			}
+		} else {
+			// Just for call init.
+			// Ignore target is online or offline
+			_, _ = target.IsActive()
 		}
 	}
 
-	return err
+	return nil
 }
 
-// GetNotificationTargets registers and initializes all notification
-// targets, returns error if any.
-func GetNotificationTargets(ctx context.Context, cfg config.Config, transport *http.Transport, test bool) (*event.TargetList, error) {
-	returnOnTargetError := false
-	return RegisterNotificationTargets(ctx, cfg, transport, nil, test, returnOnTargetError)
+func fetchSubSysTargets(ctx context.Context, cfg config.Config, subSys string, transport *http.Transport) (targets []event.Target, err error) {
+	if err := checkValidNotificationKeysForSubSys(subSys, cfg[subSys]); err != nil {
+		return nil, err
+	}
+
+	switch subSys {
+	case config.NotifyAMQPSubSys:
+		amqpTargets, err := GetNotifyAMQP(cfg[config.NotifyAMQPSubSys])
+		if err != nil {
+			return nil, err
+		}
+		for id, args := range amqpTargets {
+			if !args.Enable {
+				continue
+			}
+			t, err := target.NewAMQPTarget(id, args, logOnceIf)
+			if err != nil {
+				return nil, err
+			}
+			targets = append(targets, t)
+		}
+	case config.NotifyESSubSys:
+		esTargets, err := GetNotifyES(cfg[config.NotifyESSubSys], transport)
+		if err != nil {
+			return nil, err
+		}
+		for id, args := range esTargets {
+			if !args.Enable {
+				continue
+			}
+			t, err := target.NewElasticsearchTarget(id, args, logOnceIf)
+			if err != nil {
+				return nil, err
+			}
+			targets = append(targets, t)
+		}
+	case config.NotifyKafkaSubSys:
+		kafkaTargets, err := GetNotifyKafka(cfg[config.NotifyKafkaSubSys])
+		if err != nil {
+			return nil, err
+		}
+		for id, args := range kafkaTargets {
+			if !args.Enable {
+				continue
+			}
+			args.TLS.RootCAs = transport.TLSClientConfig.RootCAs
+			t, err := target.NewKafkaTarget(id, args, logOnceIf)
+			if err != nil {
+				return nil, err
+			}
+			targets = append(targets, t)
+		}
+
+	case config.NotifyMQTTSubSys:
+		mqttTargets, err := GetNotifyMQTT(cfg[config.NotifyMQTTSubSys], transport.TLSClientConfig.RootCAs)
+		if err != nil {
+			return nil, err
+		}
+		for id, args := range mqttTargets {
+			if !args.Enable {
+				continue
+			}
+			args.RootCAs = transport.TLSClientConfig.RootCAs
+			t, err := target.NewMQTTTarget(id, args, logOnceIf)
+			if err != nil {
+				return nil, err
+			}
+			targets = append(targets, t)
+		}
+	case config.NotifyMySQLSubSys:
+		mysqlTargets, err := GetNotifyMySQL(cfg[config.NotifyMySQLSubSys])
+		if err != nil {
+			return nil, err
+		}
+		for id, args := range mysqlTargets {
+			if !args.Enable {
+				continue
+			}
+			t, err := target.NewMySQLTarget(id, args, logOnceIf)
+			if err != nil {
+				return nil, err
+			}
+			targets = append(targets, t)
+		}
+	case config.NotifyNATSSubSys:
+		natsTargets, err := GetNotifyNATS(cfg[config.NotifyNATSSubSys], transport.TLSClientConfig.RootCAs)
+		if err != nil {
+			return nil, err
+		}
+		for id, args := range natsTargets {
+			if !args.Enable {
+				continue
+			}
+			t, err := target.NewNATSTarget(id, args, logOnceIf)
+			if err != nil {
+				return nil, err
+			}
+			targets = append(targets, t)
+		}
+	case config.NotifyNSQSubSys:
+		nsqTargets, err := GetNotifyNSQ(cfg[config.NotifyNSQSubSys])
+		if err != nil {
+			return nil, err
+		}
+		for id, args := range nsqTargets {
+			if !args.Enable {
+				continue
+			}
+			t, err := target.NewNSQTarget(id, args, logOnceIf)
+			if err != nil {
+				return nil, err
+			}
+			targets = append(targets, t)
+		}
+	case config.NotifyPostgresSubSys:
+		postgresTargets, err := GetNotifyPostgres(cfg[config.NotifyPostgresSubSys])
+		if err != nil {
+			return nil, err
+		}
+		for id, args := range postgresTargets {
+			if !args.Enable {
+				continue
+			}
+			t, err := target.NewPostgreSQLTarget(id, args, logOnceIf)
+			if err != nil {
+				return nil, err
+			}
+			targets = append(targets, t)
+		}
+	case config.NotifyRedisSubSys:
+		redisTargets, err := GetNotifyRedis(cfg[config.NotifyRedisSubSys])
+		if err != nil {
+			return nil, err
+		}
+		for id, args := range redisTargets {
+			if !args.Enable {
+				continue
+			}
+			t, err := target.NewRedisTarget(id, args, logOnceIf)
+			if err != nil {
+				return nil, err
+			}
+			targets = append(targets, t)
+		}
+	case config.NotifyWebhookSubSys:
+		webhookTargets, err := GetNotifyWebhook(cfg[config.NotifyWebhookSubSys], transport)
+		if err != nil {
+			return nil, err
+		}
+		for id, args := range webhookTargets {
+			if !args.Enable {
+				continue
+			}
+			t, err := target.NewWebhookTarget(ctx, id, args, logOnceIf, transport)
+			if err != nil {
+				return nil, err
+			}
+			targets = append(targets, t)
+		}
+	}
+	return targets, nil
 }
 
-// RegisterNotificationTargets - returns TargetList which contains enabled targets in serverConfig.
-// A new notification target is added like below
-// * Add a new target in pkg/event/target package.
-// * Add newly added target configuration to serverConfig.Notify.<TARGET_NAME>.
-// * Handle the configuration in this function to create/add into TargetList.
-func RegisterNotificationTargets(ctx context.Context, cfg config.Config, transport *http.Transport, targetIDs []event.TargetID, test bool, returnOnTargetError bool) (*event.TargetList, error) {
-	targetList, err := FetchRegisteredTargets(ctx, cfg, transport, test, returnOnTargetError)
-	if err != nil {
-		return targetList, err
-	}
-
-	if test {
-		// Verify if user is trying to disable already configured
-		// notification targets, based on their target IDs
-		for _, targetID := range targetIDs {
-			if !targetList.Exists(targetID) {
-				return nil, config.Errorf(
-					"Unable to disable configured targets '%v'",
-					targetID)
-			}
-		}
-	}
-
-	return targetList, nil
-}
-
-// FetchRegisteredTargets - Returns a set of configured TargetList
-// If `returnOnTargetError` is set to true, The function returns when a target initialization fails
-// Else, the function will return a complete TargetList irrespective of errors
-func FetchRegisteredTargets(ctx context.Context, cfg config.Config, transport *http.Transport, test bool, returnOnTargetError bool) (_ *event.TargetList, err error) {
-	targetList := event.NewTargetList()
-	var targetsOffline bool
-
-	defer func() {
-		// Automatically close all connections to targets when an error occur.
-		// Close all the targets if returnOnTargetError is set
-		// Else, close only the failed targets
-		if err != nil && returnOnTargetError {
-			for _, t := range targetList.TargetMap() {
-				_ = t.Close()
-			}
-		}
-	}()
-
-	if err = checkValidNotificationKeys(cfg); err != nil {
-		return nil, err
-	}
-
-	amqpTargets, err := GetNotifyAMQP(cfg[config.NotifyAMQPSubSys])
-	if err != nil {
-		return nil, err
-	}
-
-	esTargets, err := GetNotifyES(cfg[config.NotifyESSubSys], transport)
-	if err != nil {
-		return nil, err
-	}
-
-	kafkaTargets, err := GetNotifyKafka(cfg[config.NotifyKafkaSubSys])
-	if err != nil {
-		return nil, err
-	}
-
-	mqttTargets, err := GetNotifyMQTT(cfg[config.NotifyMQTTSubSys], transport.TLSClientConfig.RootCAs)
-	if err != nil {
-		return nil, err
-	}
-
-	mysqlTargets, err := GetNotifyMySQL(cfg[config.NotifyMySQLSubSys])
-	if err != nil {
-		return nil, err
-	}
-
-	natsTargets, err := GetNotifyNATS(cfg[config.NotifyNATSSubSys], transport.TLSClientConfig.RootCAs)
-	if err != nil {
-		return nil, err
-	}
-
-	nsqTargets, err := GetNotifyNSQ(cfg[config.NotifyNSQSubSys])
-	if err != nil {
-		return nil, err
-	}
-
-	postgresTargets, err := GetNotifyPostgres(cfg[config.NotifyPostgresSubSys])
-	if err != nil {
-		return nil, err
-	}
-
-	redisTargets, err := GetNotifyRedis(cfg[config.NotifyRedisSubSys])
-	if err != nil {
-		return nil, err
-	}
-
-	webhookTargets, err := GetNotifyWebhook(cfg[config.NotifyWebhookSubSys], transport)
-	if err != nil {
-		return nil, err
-	}
-
-	for id, args := range amqpTargets {
-		if !args.Enable {
-			continue
-		}
-		newTarget, err := target.NewAMQPTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
+// FetchEnabledTargets - Returns a set of configured TargetList
+func FetchEnabledTargets(ctx context.Context, cfg config.Config, transport *http.Transport) (_ *event.TargetList, err error) {
+	targetList := event.NewTargetList(ctx)
+	for _, subSys := range config.NotifySubSystems.ToSlice() {
+		targets, err := fetchSubSysTargets(ctx, cfg, subSys, transport)
 		if err != nil {
-			targetsOffline = true
-			if returnOnTargetError {
-				return nil, err
-			}
-			_ = newTarget.Close()
+			return nil, err
 		}
-
-		if err = targetList.Add(newTarget); err != nil {
-			logger.LogIf(context.Background(), err)
-			if returnOnTargetError {
+		for _, t := range targets {
+			if err = targetList.Add(t); err != nil {
 				return nil, err
 			}
 		}
 	}
-
-	for id, args := range esTargets {
-		if !args.Enable {
-			continue
-		}
-		newTarget, err := target.NewElasticsearchTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
-		if err != nil {
-			targetsOffline = true
-			if returnOnTargetError {
-				return nil, err
-			}
-			_ = newTarget.Close()
-		}
-		if err = targetList.Add(newTarget); err != nil {
-			logger.LogIf(context.Background(), err)
-			if returnOnTargetError {
-				return nil, err
-			}
-		}
-	}
-
-	for id, args := range kafkaTargets {
-		if !args.Enable {
-			continue
-		}
-		args.TLS.RootCAs = transport.TLSClientConfig.RootCAs
-		newTarget, err := target.NewKafkaTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
-		if err != nil {
-			targetsOffline = true
-			if returnOnTargetError {
-				return nil, err
-			}
-			_ = newTarget.Close()
-		}
-		if err = targetList.Add(newTarget); err != nil {
-			logger.LogIf(context.Background(), err)
-			if returnOnTargetError {
-				return nil, err
-			}
-		}
-	}
-
-	for id, args := range mqttTargets {
-		if !args.Enable {
-			continue
-		}
-		args.RootCAs = transport.TLSClientConfig.RootCAs
-		newTarget, err := target.NewMQTTTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
-		if err != nil {
-			targetsOffline = true
-			if returnOnTargetError {
-				return nil, err
-			}
-			_ = newTarget.Close()
-		}
-		if err = targetList.Add(newTarget); err != nil {
-			logger.LogIf(context.Background(), err)
-			if returnOnTargetError {
-				return nil, err
-			}
-		}
-	}
-
-	for id, args := range mysqlTargets {
-		if !args.Enable {
-			continue
-		}
-		newTarget, err := target.NewMySQLTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
-		if err != nil {
-			targetsOffline = true
-			if returnOnTargetError {
-				return nil, err
-			}
-			_ = newTarget.Close()
-		}
-		if err = targetList.Add(newTarget); err != nil {
-			logger.LogIf(context.Background(), err)
-			if returnOnTargetError {
-				return nil, err
-			}
-		}
-	}
-
-	for id, args := range natsTargets {
-		if !args.Enable {
-			continue
-		}
-		newTarget, err := target.NewNATSTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
-		if err != nil {
-			targetsOffline = true
-			if returnOnTargetError {
-				return nil, err
-			}
-			_ = newTarget.Close()
-		}
-		if err = targetList.Add(newTarget); err != nil {
-			logger.LogIf(context.Background(), err)
-			if returnOnTargetError {
-				return nil, err
-			}
-		}
-	}
-
-	for id, args := range nsqTargets {
-		if !args.Enable {
-			continue
-		}
-		newTarget, err := target.NewNSQTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
-		if err != nil {
-			targetsOffline = true
-			if returnOnTargetError {
-				return nil, err
-			}
-			_ = newTarget.Close()
-		}
-		if err = targetList.Add(newTarget); err != nil {
-			logger.LogIf(context.Background(), err)
-			if returnOnTargetError {
-				return nil, err
-			}
-		}
-	}
-
-	for id, args := range postgresTargets {
-		if !args.Enable {
-			continue
-		}
-		newTarget, err := target.NewPostgreSQLTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
-		if err != nil {
-			targetsOffline = true
-			if returnOnTargetError {
-				return nil, err
-			}
-			_ = newTarget.Close()
-		}
-		if err = targetList.Add(newTarget); err != nil {
-			logger.LogIf(context.Background(), err)
-			if returnOnTargetError {
-				return nil, err
-			}
-		}
-	}
-
-	for id, args := range redisTargets {
-		if !args.Enable {
-			continue
-		}
-		newTarget, err := target.NewRedisTarget(id, args, ctx.Done(), logger.LogOnceIf, test)
-		if err != nil {
-			targetsOffline = true
-			if returnOnTargetError {
-				return nil, err
-			}
-			_ = newTarget.Close()
-		}
-		if err = targetList.Add(newTarget); err != nil {
-			logger.LogIf(context.Background(), err)
-			if returnOnTargetError {
-				return nil, err
-			}
-		}
-	}
-
-	for id, args := range webhookTargets {
-		if !args.Enable {
-			continue
-		}
-		newTarget, err := target.NewWebhookTarget(ctx, id, args, logger.LogOnceIf, transport, test)
-		if err != nil {
-			targetsOffline = true
-			if returnOnTargetError {
-				return nil, err
-			}
-			_ = newTarget.Close()
-		}
-		if err = targetList.Add(newTarget); err != nil {
-			logger.LogIf(context.Background(), err)
-			if returnOnTargetError {
-				return nil, err
-			}
-		}
-	}
-
-	if targetsOffline {
-		return targetList, ErrTargetsOffline
-	}
-
 	return targetList, nil
 }
 
@@ -389,28 +287,26 @@ var (
 	}
 )
 
-func checkValidNotificationKeys(cfg config.Config) error {
-	for subSys, tgt := range cfg {
-		validKVS, ok := DefaultNotificationKVS[subSys]
-		if !ok {
-			continue
+func checkValidNotificationKeysForSubSys(subSys string, tgt map[string]config.KVS) error {
+	validKVS, ok := DefaultNotificationKVS[subSys]
+	if !ok {
+		return nil
+	}
+	for tname, kv := range tgt {
+		subSysTarget := subSys
+		if tname != config.Default {
+			subSysTarget = subSys + config.SubSystemSeparator + tname
 		}
-		for tname, kv := range tgt {
-			subSysTarget := subSys
-			if tname != config.Default {
-				subSysTarget = subSys + config.SubSystemSeparator + tname
-			}
-			if v, ok := kv.Lookup(config.Enable); ok && v == config.EnableOn {
-				if err := config.CheckValidKeys(subSysTarget, kv, validKVS); err != nil {
-					return err
-				}
+		if v, ok := kv.Lookup(config.Enable); ok && v == config.EnableOn {
+			if err := config.CheckValidKeys(subSysTarget, kv, validKVS); err != nil {
+				return err
 			}
 		}
 	}
 	return nil
 }
 
-// DefaultKakfaKVS - default KV for kafka target
+// DefaultKafkaKVS - default KV for kafka target
 var (
 	DefaultKafkaKVS = config.KVS{
 		config.KV{
@@ -473,6 +369,22 @@ var (
 			Key:   target.KafkaVersion,
 			Value: "",
 		},
+		config.KV{
+			Key:   target.KafkaBatchSize,
+			Value: "0",
+		},
+		config.KV{
+			Key:   target.KafkaBatchCommitTimeout,
+			Value: "0s",
+		},
+		config.KV{
+			Key:   target.KafkaCompressionCodec,
+			Value: "",
+		},
+		config.KV{
+			Key:   target.KafkaCompressionLevel,
+			Value: "",
+		},
 	}
 )
 
@@ -500,7 +412,7 @@ func GetNotifyKafka(kafkaKVS map[string]config.KVS) (map[string]target.KafkaArgs
 		if len(kafkaBrokers) == 0 {
 			return nil, config.Errorf("kafka 'brokers' cannot be empty")
 		}
-		for _, s := range strings.Split(kafkaBrokers, config.ValueSeparator) {
+		for s := range strings.SplitSeq(kafkaBrokers, config.ValueSeparator) {
 			var host *xnet.Host
 			host, err = xnet.ParseHost(s)
 			if err != nil {
@@ -545,13 +457,32 @@ func GetNotifyKafka(kafkaKVS map[string]config.KVS) (map[string]target.KafkaArgs
 			versionEnv = versionEnv + config.Default + k
 		}
 
+		batchSizeEnv := target.EnvKafkaBatchSize
+		if k != config.Default {
+			batchSizeEnv = batchSizeEnv + config.Default + k
+		}
+		batchSize, err := strconv.ParseUint(env.Get(batchSizeEnv, kv.Get(target.KafkaBatchSize)), 10, 32)
+		if err != nil {
+			return nil, err
+		}
+
+		batchCommitTimeoutEnv := target.EnvKafkaBatchCommitTimeout
+		if k != config.Default {
+			batchCommitTimeoutEnv = batchCommitTimeoutEnv + config.Default + k
+		}
+		batchCommitTimeout, err := time.ParseDuration(env.Get(batchCommitTimeoutEnv, kv.Get(target.KafkaBatchCommitTimeout)))
+		if err != nil {
+			return nil, err
+		}
 		kafkaArgs := target.KafkaArgs{
-			Enable:     enabled,
-			Brokers:    brokers,
-			Topic:      env.Get(topicEnv, kv.Get(target.KafkaTopic)),
-			QueueDir:   env.Get(queueDirEnv, kv.Get(target.KafkaQueueDir)),
-			QueueLimit: queueLimit,
-			Version:    env.Get(versionEnv, kv.Get(target.KafkaVersion)),
+			Enable:             enabled,
+			Brokers:            brokers,
+			Topic:              env.Get(topicEnv, kv.Get(target.KafkaTopic)),
+			QueueDir:           env.Get(queueDirEnv, kv.Get(target.KafkaQueueDir)),
+			QueueLimit:         queueLimit,
+			Version:            env.Get(versionEnv, kv.Get(target.KafkaVersion)),
+			BatchSize:          uint32(batchSize),
+			BatchCommitTimeout: batchCommitTimeout,
 		}
 
 		tlsEnableEnv := target.EnvKafkaTLS
@@ -579,6 +510,19 @@ func GetNotifyKafka(kafkaKVS map[string]config.KVS) (map[string]target.KafkaArgs
 
 		kafkaArgs.TLS.ClientTLSCert = env.Get(tlsClientTLSCertEnv, kv.Get(target.KafkaClientTLSCert))
 		kafkaArgs.TLS.ClientTLSKey = env.Get(tlsClientTLSKeyEnv, kv.Get(target.KafkaClientTLSKey))
+
+		compressionCodecEnv := target.EnvKafkaProducerCompressionCodec
+		if k != config.Default {
+			compressionCodecEnv = compressionCodecEnv + config.Default + k
+		}
+		kafkaArgs.Producer.Compression = env.Get(compressionCodecEnv, kv.Get(target.KafkaCompressionCodec))
+
+		compressionLevelEnv := target.EnvKafkaProducerCompressionLevel
+		if k != config.Default {
+			compressionLevelEnv = compressionLevelEnv + config.Default + k
+		}
+		compressionLevel, _ := strconv.Atoi(env.Get(compressionLevelEnv, kv.Get(target.KafkaCompressionLevel)))
+		kafkaArgs.Producer.CompressionLevel = compressionLevel
 
 		saslEnableEnv := target.EnvKafkaSASLEnable
 		if k != config.Default {
@@ -925,20 +869,28 @@ var (
 			Value: "0",
 		},
 		config.KV{
-			Key:   target.NATSStreaming,
+			Key:   target.NATSJetStream,
 			Value: config.EnableOff,
 		},
 		config.KV{
-			Key:   target.NATSStreamingAsync,
-			Value: config.EnableOff,
+			Key:           target.NATSStreaming,
+			Value:         config.EnableOff,
+			HiddenIfEmpty: true,
 		},
 		config.KV{
-			Key:   target.NATSStreamingMaxPubAcksInFlight,
-			Value: "0",
+			Key:           target.NATSStreamingAsync,
+			Value:         config.EnableOff,
+			HiddenIfEmpty: true,
 		},
 		config.KV{
-			Key:   target.NATSStreamingClusterID,
-			Value: "",
+			Key:           target.NATSStreamingMaxPubAcksInFlight,
+			Value:         "0",
+			HiddenIfEmpty: true,
+		},
+		config.KV{
+			Key:           target.NATSStreamingClusterID,
+			Value:         "",
+			HiddenIfEmpty: true,
 		},
 		config.KV{
 			Key:   target.NATSQueueDir,
@@ -1008,6 +960,11 @@ func GetNotifyNATS(natsKVS map[string]config.KVS, rootCAs *x509.CertPool) (map[s
 			tlsSkipVerifyEnv = tlsSkipVerifyEnv + config.Default + k
 		}
 
+		tlsHandshakeFirstEnv := target.EnvNatsTLSHandshakeFirst
+		if k != config.Default {
+			tlsHandshakeFirstEnv = tlsHandshakeFirstEnv + config.Default + k
+		}
+
 		subjectEnv := target.EnvNATSSubject
 		if k != config.Default {
 			subjectEnv = subjectEnv + config.Default + k
@@ -1018,6 +975,11 @@ func GetNotifyNATS(natsKVS map[string]config.KVS, rootCAs *x509.CertPool) (map[s
 			usernameEnv = usernameEnv + config.Default + k
 		}
 
+		userCredentialsEnv := target.NATSUserCredentials
+		if k != config.Default {
+			userCredentialsEnv = userCredentialsEnv + config.Default + k
+		}
+
 		passwordEnv := target.EnvNATSPassword
 		if k != config.Default {
 			passwordEnv = passwordEnv + config.Default + k
@@ -1026,6 +988,11 @@ func GetNotifyNATS(natsKVS map[string]config.KVS, rootCAs *x509.CertPool) (map[s
 		tokenEnv := target.EnvNATSToken
 		if k != config.Default {
 			tokenEnv = tokenEnv + config.Default + k
+		}
+
+		nKeySeedEnv := target.EnvNATSNKeySeed
+		if k != config.Default {
+			nKeySeedEnv = nKeySeedEnv + config.Default + k
 		}
 
 		queueDirEnv := target.EnvNATSQueueDir
@@ -1048,23 +1015,32 @@ func GetNotifyNATS(natsKVS map[string]config.KVS, rootCAs *x509.CertPool) (map[s
 			clientKeyEnv = clientKeyEnv + config.Default + k
 		}
 
-		natsArgs := target.NATSArgs{
-			Enable:        true,
-			Address:       *address,
-			Subject:       env.Get(subjectEnv, kv.Get(target.NATSSubject)),
-			Username:      env.Get(usernameEnv, kv.Get(target.NATSUsername)),
-			Password:      env.Get(passwordEnv, kv.Get(target.NATSPassword)),
-			CertAuthority: env.Get(certAuthorityEnv, kv.Get(target.NATSCertAuthority)),
-			ClientCert:    env.Get(clientCertEnv, kv.Get(target.NATSClientCert)),
-			ClientKey:     env.Get(clientKeyEnv, kv.Get(target.NATSClientKey)),
-			Token:         env.Get(tokenEnv, kv.Get(target.NATSToken)),
-			TLS:           env.Get(tlsEnv, kv.Get(target.NATSTLS)) == config.EnableOn,
-			TLSSkipVerify: env.Get(tlsSkipVerifyEnv, kv.Get(target.NATSTLSSkipVerify)) == config.EnableOn,
-			PingInterval:  pingInterval,
-			QueueDir:      env.Get(queueDirEnv, kv.Get(target.NATSQueueDir)),
-			QueueLimit:    queueLimit,
-			RootCAs:       rootCAs,
+		jetStreamEnableEnv := target.EnvNATSJetStream
+		if k != config.Default {
+			jetStreamEnableEnv = jetStreamEnableEnv + config.Default + k
 		}
+
+		natsArgs := target.NATSArgs{
+			Enable:            true,
+			Address:           *address,
+			Subject:           env.Get(subjectEnv, kv.Get(target.NATSSubject)),
+			Username:          env.Get(usernameEnv, kv.Get(target.NATSUsername)),
+			UserCredentials:   env.Get(userCredentialsEnv, kv.Get(target.NATSUserCredentials)),
+			Password:          env.Get(passwordEnv, kv.Get(target.NATSPassword)),
+			CertAuthority:     env.Get(certAuthorityEnv, kv.Get(target.NATSCertAuthority)),
+			ClientCert:        env.Get(clientCertEnv, kv.Get(target.NATSClientCert)),
+			ClientKey:         env.Get(clientKeyEnv, kv.Get(target.NATSClientKey)),
+			Token:             env.Get(tokenEnv, kv.Get(target.NATSToken)),
+			NKeySeed:          env.Get(nKeySeedEnv, kv.Get(target.NATSNKeySeed)),
+			TLS:               env.Get(tlsEnv, kv.Get(target.NATSTLS)) == config.EnableOn,
+			TLSSkipVerify:     env.Get(tlsSkipVerifyEnv, kv.Get(target.NATSTLSSkipVerify)) == config.EnableOn,
+			TLSHandshakeFirst: env.Get(tlsHandshakeFirstEnv, kv.Get(target.NATSTLSHandshakeFirst)) == config.EnableOn,
+			PingInterval:      pingInterval,
+			QueueDir:          env.Get(queueDirEnv, kv.Get(target.NATSQueueDir)),
+			QueueLimit:        queueLimit,
+			RootCAs:           rootCAs,
+		}
+		natsArgs.JetStream.Enable = env.Get(jetStreamEnableEnv, kv.Get(target.NATSJetStream)) == config.EnableOn
 
 		streamingEnableEnv := target.EnvNATSStreaming
 		if k != config.Default {
@@ -1343,6 +1319,10 @@ var (
 			Value: "",
 		},
 		config.KV{
+			Key:   target.RedisUser,
+			Value: "",
+		},
+		config.KV{
 			Key:   target.RedisQueueDir,
 			Value: "",
 		},
@@ -1394,6 +1374,10 @@ func GetNotifyRedis(redisKVS map[string]config.KVS) (map[string]target.RedisArgs
 		if k != config.Default {
 			passwordEnv = passwordEnv + config.Default + k
 		}
+		userEnv := target.EnvRedisUser
+		if k != config.Default {
+			userEnv = userEnv + config.Default + k
+		}
 		keyEnv := target.EnvRedisKey
 		if k != config.Default {
 			keyEnv = keyEnv + config.Default + k
@@ -1407,6 +1391,7 @@ func GetNotifyRedis(redisKVS map[string]config.KVS) (map[string]target.RedisArgs
 			Format:     env.Get(formatEnv, kv.Get(target.RedisFormat)),
 			Addr:       *addr,
 			Password:   env.Get(passwordEnv, kv.Get(target.RedisPassword)),
+			User:       env.Get(userEnv, kv.Get(target.RedisUser)),
 			Key:        env.Get(keyEnv, kv.Get(target.RedisKey)),
 			QueueDir:   env.Get(queueDirEnv, kv.Get(target.RedisQueueDir)),
 			QueueLimit: uint64(queueLimit),
@@ -1455,7 +1440,8 @@ var (
 
 // GetNotifyWebhook - returns a map of registered notification 'webhook' targets
 func GetNotifyWebhook(webhookKVS map[string]config.KVS, transport *http.Transport) (
-	map[string]target.WebhookArgs, error) {
+	map[string]target.WebhookArgs, error,
+) {
 	webhookTargets := make(map[string]target.WebhookArgs)
 	for k, kv := range config.Merge(webhookKVS, target.EnvWebhookEnable, DefaultWebhookKVS) {
 		enableEnv := target.EnvWebhookEnable
@@ -1720,7 +1706,7 @@ func GetNotifyAMQP(amqpKVS map[string]config.KVS) (map[string]target.AMQPArgs, e
 		if k != config.Default {
 			urlEnv = urlEnv + config.Default + k
 		}
-		url, err := xnet.ParseURL(env.Get(urlEnv, kv.Get(target.AmqpURL)))
+		url, err := amqp091.ParseURI(env.Get(urlEnv, kv.Get(target.AmqpURL)))
 		if err != nil {
 			return nil, err
 		}
@@ -1786,7 +1772,7 @@ func GetNotifyAMQP(amqpKVS map[string]config.KVS) (map[string]target.AMQPArgs, e
 		}
 		amqpArgs := target.AMQPArgs{
 			Enable:            enabled,
-			URL:               *url,
+			URL:               url,
 			Exchange:          env.Get(exchangeEnv, kv.Get(target.AmqpExchange)),
 			RoutingKey:        env.Get(routingKeyEnv, kv.Get(target.AmqpRoutingKey)),
 			ExchangeType:      env.Get(exchangeTypeEnv, kv.Get(target.AmqpExchangeType)),

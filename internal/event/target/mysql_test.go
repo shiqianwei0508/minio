@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -19,6 +19,7 @@ package target
 
 import (
 	"database/sql"
+	"slices"
 	"testing"
 )
 
@@ -26,11 +27,8 @@ import (
 // is registered and fails otherwise.
 func TestMySQLRegistration(t *testing.T) {
 	var found bool
-	for _, drv := range sql.Drivers() {
-		if drv == "mysql" {
-			found = true
-			break
-		}
+	if slices.Contains(sql.Drivers(), "mysql") {
+		found = true
 	}
 	if !found {
 		t.Fatal("mysql driver not registered")

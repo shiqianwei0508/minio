@@ -1,261 +1,170 @@
+> [!NOTE]
+> **THIS REPOSITORY IS NO LONGER MAINTAINED.**
+>
+> **Alternatives:**
+> - **[AIStor Free](https://min.io/download)** — Full-featured, standalone edition for community use (free license)
+> - **[AIStor Enterprise](https://min.io/pricing)** — Distributed edition with commercial support
+
+---
+
 # MinIO Quickstart Guide
+
 [![Slack](https://slack.min.io/slack?type=svg)](https://slack.min.io) [![Docker Pulls](https://img.shields.io/docker/pulls/minio/minio.svg?maxAge=604800)](https://hub.docker.com/r/minio/minio/) [![license](https://img.shields.io/badge/license-AGPL%20V3-blue)](https://github.com/minio/minio/blob/master/LICENSE)
 
 [![MinIO](https://raw.githubusercontent.com/minio/minio/master/.github/logo.svg?sanitize=true)](https://min.io)
 
-MinIO is a High Performance Object Storage released under GNU Affero General Public License v3.0. It is API compatible with Amazon S3 cloud storage service. Use MinIO to build high performance infrastructure for machine learning, analytics and application data workloads.
+MinIO is a high-performance, S3-compatible object storage solution released under the GNU AGPL v3.0 license.
+Designed for speed and scalability, it powers AI/ML, analytics, and data-intensive workloads with industry-leading performance.
 
-This README provides quickstart instructions on running MinIO on baremetal hardware, including container-based installations. For Kubernetes environments, use the [MinIO Kubernetes Operator](https://github.com/minio/operator/blob/master/README.md).
+- S3 API Compatible – Seamless integration with existing S3 tools
+- Built for AI & Analytics – Optimized for large-scale data pipelines
+- High Performance – Ideal for demanding storage workloads.
 
-# Container Installation
+This README provides instructions for building MinIO from source and deploying onto baremetal hardware.
+Use the [MinIO Documentation](https://github.com/minio/docs) project to build and host a local copy of the documentation.
 
-Use the following commands to run a standalone MinIO server as a container.
+## MinIO is Open Source Software
 
-Standalone MinIO servers are best suited for early development and evaluation. Certain features such as versioning, object locking, and bucket replication
-require distributed deploying MinIO with Erasure Coding. For extended development and production, deploy MinIO with Erasure Coding enabled - specifically,
-with a *minimum* of 4 drives per MinIO server. See [MinIO Erasure Code Quickstart Guide](https://docs.min.io/docs/minio-erasure-code-quickstart-guide.html)
-for more complete documentation.
+We designed MinIO as Open Source software for the Open Source software community. We encourage the community to remix, redesign, and reshare MinIO under the terms of the AGPLv3 license.
 
-## Stable
+All usage of MinIO in your application stack requires validation against AGPLv3 obligations, which include but are not limited to the release of modified code to the community from which you have benefited. Any commercial/proprietary usage of the AGPLv3 software, including repackaging or reselling services/features, is done at your own risk.
 
-Run the following command to run the latest stable image of MinIO as a container using an ephemeral data volume:
+The AGPLv3 provides no obligation by any party to support, maintain, or warranty the original or any modified work.
+All support is provided on a best-effort basis through Github and our [Slack](https://slack.min.io) channel, and any member of the community is welcome to contribute and assist others in their usage of the software.
 
-```sh
-podman run -p 9000:9000 -p 9001:9001 \
-  quay.io/minio/minio server /data --console-address ":9001"
-```
+MinIO [AIStor](https://www.min.io/product/aistor) includes enterprise-grade support and licensing for workloads which require commercial or proprietary usage and production-level SLA/SLO-backed support. For more information, [reach out for a quote](https://min.io/pricing).
 
-The MinIO deployment starts using default root credentials `minioadmin:minioadmin`. You can test the deployment using the MinIO Console, an embedded
-object browser built into MinIO Server. Point a web browser running on the host machine to http://127.0.0.1:9000 and log in with the
-root credentials. You can use the Browser to create buckets, upload objects, and browse the contents of the MinIO server.
+## Source-Only Distribution
 
-You can also connect using any S3-compatible tool, such as the MinIO Client `mc` commandline tool. See
-[Test using MinIO Client `mc`](#test-using-minio-client-mc) for more information on using the `mc` commandline tool. For application developers,
-see https://docs.min.io/docs/ and click **MinIO SDKs** in the navigation to view MinIO SDKs for supported languages.
+**Important:** The MinIO community edition is now distributed as source code only. We will no longer provide pre-compiled binary releases for the community version.
 
-> NOTE: To deploy MinIO on with persistent storage, you must map local persistent directories from the host OS to the container using the `podman -v` option. For example, `-v /mnt/data:/data` maps the host OS drive at `/mnt/data` to `/data` on the container.
+### Installing Latest MinIO Community Edition
 
-# macOS
+To use MinIO community edition, you have two options:
 
-Use the following commands to run a standalone MinIO server on macOS.
+1. **Install from source** using `go install github.com/minio/minio@latest` (recommended)
+2. **Build a Docker image** from the provided Dockerfile
 
-Standalone MinIO servers are best suited for early development and evaluation. Certain features such as versioning, object locking, and bucket replication require distributed deploying MinIO with Erasure Coding. For extended development and production, deploy MinIO with Erasure Coding enabled - specifically, with a *minimum* of 4 drives per MinIO server. See [MinIO Erasure Code Quickstart Guide](https://docs.min.io/docs/minio-erasure-code-quickstart-guide.html) for more complete documentation.
+See the sections below for detailed instructions on each method.
 
-## Homebrew (recommended)
+### Legacy Binary Releases
 
-Run the following command to install the latest stable MinIO package using [Homebrew](https://brew.sh/). Replace ``/data`` with the path to the drive or directory in which you want MinIO to store data.
+Historical pre-compiled binary releases remain available for reference but are no longer maintained:
 
-```sh
-brew install minio/stable/minio
-minio server /data
-```
+- GitHub Releases: https://github.com/minio/minio/releases
+- Direct downloads: https://dl.min.io/server/minio/release/
 
-> NOTE: If you previously installed minio using `brew install minio` then it is recommended that you reinstall minio from `minio/stable/minio` official repo instead.
+**These legacy binaries will not receive updates.** We strongly recommend using source builds for access to the latest features, bug fixes, and security updates.
 
-```sh
-brew uninstall minio
-brew install minio/stable/minio
-```
+## Install from Source
 
-The MinIO deployment starts using default root credentials `minioadmin:minioadmin`. You can test the deployment using the MinIO Console, an embedded web-based object browser built into MinIO Server. Point a web browser running on the host machine to http://127.0.0.1:9000 and log in with the root credentials. You can use the Browser to create buckets, upload objects, and browse the contents of the MinIO server.
-
-You can also connect using any S3-compatible tool, such as the MinIO Client `mc` commandline tool. See [Test using MinIO Client `mc`](#test-using-minio-client-mc) for more information on using the `mc` commandline tool. For application developers, see https://docs.min.io/docs/ and click **MinIO SDKs** in the navigation to view MinIO SDKs for supported languages.
-
-## Binary Download
-
-Use the following command to download and run a standalone MinIO server on macOS. Replace ``/data`` with the path to the drive or directory in which you want MinIO to store data.
+Use the following commands to compile and run a standalone MinIO server from source.
+If you do not have a working Golang environment, please follow [How to install Golang](https://golang.org/doc/install). Minimum version required is [go1.24](https://golang.org/dl/#stable)
 
 ```sh
-wget https://dl.min.io/server/minio/release/darwin-amd64/minio
-chmod +x minio
-./minio server /data
+go install github.com/minio/minio@latest
 ```
 
-The MinIO deployment starts using default root credentials `minioadmin:minioadmin`. You can test the deployment using the MinIO Console, an embedded web-based object browser built into MinIO Server. Point a web browser running on the host machine to http://127.0.0.1:9000 and log in with the root credentials. You can use the Browser to create buckets, upload objects, and browse the contents of the MinIO server.
+You can alternatively run `go build` and use the `GOOS` and `GOARCH` environment variables to control the OS and architecture target.
+For example:
 
-You can also connect using any S3-compatible tool, such as the MinIO Client `mc` commandline tool. See [Test using MinIO Client `mc`](#test-using-minio-client-mc) for more information on using the `mc` commandline tool. For application developers, see https://docs.min.io/docs/ and click **MinIO SDKs** in the navigation to view MinIO SDKs for supported languages.
+```
+env GOOS=linux GOARCH=arm64 go build
+```
 
-# GNU/Linux
+Start MinIO by running `minio server PATH` where `PATH` is any empty folder on your local filesystem.
 
-Use the following command to run a standalone MinIO server on Linux hosts running 64-bit Intel/AMD architectures. Replace ``/data`` with the path to the drive or directory in which you want MinIO to store data.
+The MinIO deployment starts using default root credentials `minioadmin:minioadmin`.
+You can test the deployment using the MinIO Console, an embedded web-based object browser built into MinIO Server.
+Point a web browser running on the host machine to <http://127.0.0.1:9000> and log in with the root credentials.
+You can use the Browser to create buckets, upload objects, and browse the contents of the MinIO server.
+
+You can also connect using any S3-compatible tool, such as the MinIO Client `mc` commandline tool:
 
 ```sh
-wget https://dl.min.io/server/minio/release/linux-amd64/minio
-chmod +x minio
-./minio server /data
+mc alias set local http://localhost:9000 minioadmin minioadmin
+mc admin info local
 ```
 
-Replace ``/data`` with the path to the drive or directory in which you want MinIO to store data.
+See [Test using MinIO Client `mc`](#test-using-minio-client-mc) for more information on using the `mc` commandline tool.
+For application developers, see <https://docs.min.io/enterprise/aistor-object-store/developers/sdk/> to view MinIO SDKs for supported languages.
 
-The following table lists supported architectures. Replace the `wget` URL with the architecture for your Linux host.
+> [!NOTE]
+> Production environments using compiled-from-source MinIO binaries do so at their own risk.
+> The AGPLv3 license provides no warranties nor liabilities for any such usage.
 
-| Architecture                   | URL                                                        |
-| --------                       | ------                                                     |
-| 64-bit Intel/AMD               | https://dl.min.io/server/minio/release/linux-amd64/minio   |
-| 64-bit ARM                     | https://dl.min.io/server/minio/release/linux-arm64/minio   |
-| 64-bit PowerPC LE (ppc64le)    | https://dl.min.io/server/minio/release/linux-ppc64le/minio |
-| IBM Z-Series (S390X)           | https://dl.min.io/server/minio/release/linux-s390x/minio   |
+## Build Docker Image
 
-The MinIO deployment starts using default root credentials `minioadmin:minioadmin`. You can test the deployment using the MinIO Console, an embedded web-based object browser built into MinIO Server. Point a web browser running on the host machine to http://127.0.0.1:9000 and log in with the root credentials. You can use the Browser to create buckets, upload objects, and browse the contents of the MinIO server.
+You can use the `docker build .` command to build a Docker image on your local host machine.
+You must first [build MinIO](#install-from-source) and ensure the `minio` binary exists in the project root.
 
-You can also connect using any S3-compatible tool, such as the MinIO Client `mc` commandline tool. See [Test using MinIO Client `mc`](#test-using-minio-client-mc) for more information on using the `mc` commandline tool. For application developers, see https://docs.min.io/docs/ and click **MinIO SDKs** in the navigation to view MinIO SDKs for supported languages.
-
-> NOTE: Standalone MinIO servers are best suited for early development and evaluation. Certain features such as versioning, object locking, and bucket replication require distributed deploying MinIO with Erasure Coding. For extended development and production, deploy MinIO with Erasure Coding enabled - specifically, with a *minimum* of 4 drives per MinIO server. See [MinIO Erasure Code Quickstart Guide](https://docs.min.io/docs/minio-erasure-code-quickstart-guide.html) for more complete documentation.
-
-# Microsoft Windows
-
-To run MinIO on 64-bit Windows hosts, download the MinIO executable from the following URL:
+The following command builds the Docker image using the default `Dockerfile` in the root project directory with the repository and image tag `myminio:minio`
 
 ```sh
-https://dl.min.io/server/minio/release/windows-amd64/minio.exe
+docker build -t myminio:minio .
 ```
 
-Use the following command to run a standalone MinIO server on the Windows host. Replace ``D:\`` with the path to the drive or directory in which you want MinIO to store data. You must change the terminal or powershell directory to the location of the ``minio.exe`` executable, *or* add the path to that directory to the system ``$PATH``:
+Use `docker image ls` to confirm the image exists in your local repository.
+You can run the server using standard Docker invocation:
 
 ```sh
-minio.exe server D:\
+docker run -p 9000:9000 -p 9001:9001 myminio:minio server /tmp/minio --console-address :9001
 ```
 
-The MinIO deployment starts using default root credentials `minioadmin:minioadmin`. You can test the deployment using the MinIO Console, an embedded web-based object browser built into MinIO Server. Point a web browser running on the host machine to http://127.0.0.1:9000 and log in with the root credentials. You can use the Browser to create buckets, upload objects, and browse the contents of the MinIO server.
+Complete documentation for building Docker containers, managing custom images, or loading images into orchestration platforms is out of scope for this documentation.
+You can modify the `Dockerfile` and `dockerscripts/docker-entrypoint.sh` as-needed to reflect your specific image requirements.
 
-You can also connect using any S3-compatible tool, such as the MinIO Client `mc` commandline tool. See [Test using MinIO Client `mc`](#test-using-minio-client-mc) for more information on using the `mc` commandline tool. For application developers, see https://docs.min.io/docs/ and click **MinIO SDKs** in the navigation to view MinIO SDKs for supported languages.
+See the [MinIO Container](https://docs.min.io/community/minio-object-store/operations/deployments/baremetal-deploy-minio-as-a-container.html#deploy-minio-container) documentation for more guidance on running MinIO within a Container image.
 
-> NOTE: Standalone MinIO servers are best suited for early development and evaluation. Certain features such as versioning, object locking, and bucket replication require distributed deploying MinIO with Erasure Coding. For extended development and production, deploy MinIO with Erasure Coding enabled - specifically, with a *minimum* of 4 drives per MinIO server. See [MinIO Erasure Code Quickstart Guide](https://docs.min.io/docs/minio-erasure-code-quickstart-guide.html) for more complete documentation.
+## Install using Helm Charts
 
-# Install from Source
+There are two paths for installing MinIO onto Kubernetes infrastructure:
 
-Use the following commands to compile and run a standalone MinIO server from source. Source installation is only intended for developers and advanced users. If you do not have a working Golang environment, please follow [How to install Golang](https://golang.org/doc/install). Minimum version required is [go1.16](https://golang.org/dl/#stable)
+- Use the [MinIO Operator](https://github.com/minio/operator)
+- Use the community-maintained [Helm charts](https://github.com/minio/minio/tree/master/helm/minio)
+
+See the [MinIO Documentation](https://docs.min.io/community/minio-object-store/operations/deployments/kubernetes.html) for guidance on deploying using the Operator.
+The Community Helm chart has instructions in the folder-level README.
+
+## Test MinIO Connectivity
+
+### Test using MinIO Console
+
+MinIO Server comes with an embedded web based object browser.
+Point your web browser to <http://127.0.0.1:9000> to ensure your server has started successfully.
+
+> [!NOTE]
+> MinIO runs console on random port by default, if you wish to choose a specific port use `--console-address` to pick a specific interface and port.
+
+### Test using MinIO Client `mc`
+
+`mc` provides a modern alternative to UNIX commands like ls, cat, cp, mirror, diff etc. It supports filesystems and Amazon S3 compatible cloud storage services.
+
+The following commands set a local alias, validate the server information, create a bucket, copy data to that bucket, and list the contents of the bucket.
 
 ```sh
-GO111MODULE=on go install github.com/minio/minio@latest
+mc alias set local http://localhost:9000 minioadmin minioadmin
+mc admin info
+mc mb data
+mc cp ~/Downloads/mydata data/
+mc ls data/
 ```
 
-The MinIO deployment starts using default root credentials `minioadmin:minioadmin`. You can test the deployment using the MinIO Console, an embedded web-based object browser built into MinIO Server. Point a web browser running on the host machine to http://127.0.0.1:9000 and log in with the root credentials. You can use the Browser to create buckets, upload objects, and browse the contents of the MinIO server.
+Follow the MinIO Client [Quickstart Guide](https://docs.min.io/community/minio-object-store/reference/minio-mc.html#quickstart) for further instructions.
 
-You can also connect using any S3-compatible tool, such as the MinIO Client `mc` commandline tool. See [Test using MinIO Client `mc`](#test-using-minio-client-mc) for more information on using the `mc` commandline tool. For application developers, see https://docs.min.io/docs/ and click **MinIO SDKs** in the navigation to view MinIO SDKs for supported languages.
+## Explore Further
 
-> NOTE: Standalone MinIO servers are best suited for early development and evaluation. Certain features such as versioning, object locking, and bucket replication require distributed deploying MinIO with Erasure Coding. For extended development and production, deploy MinIO with Erasure Coding enabled - specifically, with a *minimum* of 4 drives per MinIO server. See [MinIO Erasure Code Quickstart Guide](https://docs.min.io/docs/minio-erasure-code-quickstart-guide.html) for more complete documentation.
+- [The MinIO documentation website](https://docs.min.io/community/minio-object-store/index.html)
+- [MinIO Erasure Code Overview](https://docs.min.io/community/minio-object-store/operations/concepts/erasure-coding.html)
+- [Use `mc` with MinIO Server](https://docs.min.io/community/minio-object-store/reference/minio-mc.html)
+- [Use `minio-go` SDK with MinIO Server](https://docs.min.io/enterprise/aistor-object-store/developers/sdk/go/)
 
-MinIO strongly recommends *against* using compiled-from-source MinIO servers for production environments.
+## Contribute to MinIO Project
 
-# Deployment Recommendations
+Please follow MinIO [Contributor's Guide](https://github.com/minio/minio/blob/master/CONTRIBUTING.md) for guidance on making new contributions to the repository.
 
-## Allow port access for Firewalls
+## License
 
-By default MinIO uses the port 9000 to listen for incoming connections. If your platform blocks the port by default, you may need to enable access to the port.
-
-### ufw
-
-For hosts with ufw enabled (Debian based distros), you can use `ufw` command to allow traffic to specific ports. Use below command to allow access to port 9000
-
-```sh
-ufw allow 9000
-```
-
-Below command enables all incoming traffic to ports ranging from 9000 to 9010.
-
-```sh
-ufw allow 9000:9010/tcp
-```
-
-### firewall-cmd
-
-For hosts with firewall-cmd enabled (CentOS), you can use `firewall-cmd` command to allow traffic to specific ports. Use below commands to allow access to port 9000
-
-```sh
-firewall-cmd --get-active-zones
-```
-
-This command gets the active zone(s). Now, apply port rules to the relevant zones returned above. For example if the zone is `public`, use
-
-```sh
-firewall-cmd --zone=public --add-port=9000/tcp --permanent
-```
-
-Note that `permanent` makes sure the rules are persistent across firewall start, restart or reload. Finally reload the firewall for changes to take effect.
-
-```sh
-firewall-cmd --reload
-```
-
-### iptables
-
-For hosts with iptables enabled (RHEL, CentOS, etc), you can use `iptables` command to enable all traffic coming to specific ports. Use below command to allow
-access to port 9000
-
-```sh
-iptables -A INPUT -p tcp --dport 9000 -j ACCEPT
-service iptables restart
-```
-
-Below command enables all incoming traffic to ports ranging from 9000 to 9010.
-
-```sh
-iptables -A INPUT -p tcp --dport 9000:9010 -j ACCEPT
-service iptables restart
-```
-
-## Pre-existing data
-When deployed on a single drive, MinIO server lets clients access any pre-existing data in the data directory. For example, if MinIO is started with the command  `minio server /mnt/data`, any pre-existing data in the `/mnt/data` directory would be accessible to the clients.
-
-The above statement is also valid for all gateway backends.
-
-# Test MinIO Connectivity
-
-## Test using MinIO Console
-MinIO Server comes with an embedded web based object browser. Point your web browser to http://127.0.0.1:9000 to ensure your server has started successfully.
-
-> NOTE: MinIO runs console on random port by default if you wish choose a specific port use `--console-address` to pick a specific interface and port.
-
-### Things to consider
-MinIO redirects browser access requests to the configured server port (i.e. `127.0.0.1:9000`) to the configured Console port. MinIO uses the hostname or IP address specified in the request when building the redirect URL. The URL and port *must* be accessible by the client for the redirection to work.
-
-For deployments behind a load balancer, proxy, or ingress rule where the MinIO host IP address or port is not public, use the `MINIO_BROWSER_REDIRECT_URL` environment variable to specify the external hostname for the redirect. The LB/Proxy must have rules for directing traffic to the Console port specifically.
-
-For example, consider a MinIO deployment behind a proxy `https://minio.example.net`, `https://console.minio.example.net` with rules for forwarding traffic on port :9000 and :9001 to MinIO and the MinIO Console respectively on the internal network. Set `MINIO_BROWSER_REDIRECT_URL` to `https://console.minio.example.net` to ensure the browser receives a valid reachable URL.
-
-Similarly, if your TLS certificates do not have the IP SAN for the MinIO server host, the MinIO Console may fail to validate the connection to the server. Use the `MINIO_SERVER_URL` environment variable  and specify the proxy-accessible hostname of the MinIO server to allow the Console to use the MinIO server API using the TLS certificate.
-
-For example: `export MINIO_SERVER_URL="https://minio.example.net"`
-
-
-| Dashboard                                                                                   | Creating a bucket                                                                           |
-| -------------                                                                               | -------------                                                                               |
-| ![Dashboard](https://github.com/minio/minio/blob/master/docs/screenshots/pic1.png?raw=true) | ![Dashboard](https://github.com/minio/minio/blob/master/docs/screenshots/pic2.png?raw=true) |
-
-## Test using MinIO Client `mc`
-`mc` provides a modern alternative to UNIX commands like ls, cat, cp, mirror, diff etc. It supports filesystems and Amazon S3 compatible cloud storage services. Follow the MinIO Client [Quickstart Guide](https://docs.min.io/docs/minio-client-quickstart-guide) for further instructions.
-
-# Upgrading MinIO
-MinIO server supports rolling upgrades, i.e. you can update one MinIO instance at a time in a distributed cluster. This allows upgrades with no downtime. Upgrades can be done manually by replacing the binary with the latest release and restarting all servers in a rolling fashion. However, we recommend all our users to use [`mc admin update`](https://docs.min.io/docs/minio-admin-complete-guide.html#update) from the client. This will update all the nodes in the cluster simultaneously and restart them, as shown in the following command from the MinIO client (mc):
-
-```
-mc admin update <minio alias, e.g., myminio>
-```
-
-> NOTE: some releases might not allow rolling upgrades, this is always called out in the release notes and it is generally advised to read release notes before upgrading. In such a situation `mc admin update` is the recommended upgrading mechanism to upgrade all servers at once.
-
-## Important things to remember during MinIO upgrades
-
-- `mc admin update` will only work if the user running MinIO has write access to the parent directory where the binary is located, for example if the current binary is at `/usr/local/bin/minio`, you would need write access to `/usr/local/bin`.
-- `mc admin update` updates and restarts all servers simultaneously, applications would retry and continue their respective operations upon upgrade.
-- `mc admin update` is disabled in kubernetes/container environments, container environments provide their own mechanisms to rollout of updates.
-- In the case of federated setups `mc admin update` should be run against each cluster individually. Avoid updating `mc` to any new releases until all clusters have been successfully updated.
-- If using `kes` as KMS with MinIO, just replace the binary and restart `kes` more information about `kes` can be found [here](https://github.com/minio/kes/wiki)
-- If using Vault as KMS with MinIO, ensure you have followed the Vault upgrade procedure outlined here: https://www.vaultproject.io/docs/upgrading/index.html
-- If using etcd with MinIO for the federation, ensure you have followed the etcd upgrade procedure outlined here: https://github.com/etcd-io/etcd/blob/master/Documentation/upgrades/upgrading-etcd.md
-
-# Explore Further
-- [MinIO Erasure Code QuickStart Guide](https://docs.min.io/docs/minio-erasure-code-quickstart-guide)
-- [Use `mc` with MinIO Server](https://docs.min.io/docs/minio-client-quickstart-guide)
-- [Use `aws-cli` with MinIO Server](https://docs.min.io/docs/aws-cli-with-minio)
-- [Use `s3cmd` with MinIO Server](https://docs.min.io/docs/s3cmd-with-minio)
-- [Use `minio-go` SDK with MinIO Server](https://docs.min.io/docs/golang-client-quickstart-guide)
-- [The MinIO documentation website](https://docs.min.io)
-
-# Contribute to MinIO Project
-Please follow MinIO [Contributor's Guide](https://github.com/minio/minio/blob/master/CONTRIBUTING.md)
-
-# License
-MinIO source is licensed under the GNU AGPLv3 license that can be found in the [LICENSE](https://github.com/minio/minio/blob/master/LICENSE) file.
-MinIO [Documentation](https://github.com/minio/minio/tree/master/docs) © 2021 by MinIO, Inc is licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+- MinIO source is licensed under the [GNU AGPLv3](https://github.com/minio/minio/blob/master/LICENSE).
+- MinIO [documentation](https://github.com/minio/minio/tree/master/docs) is licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+- [License Compliance](https://github.com/minio/minio/blob/master/COMPLIANCE.md)

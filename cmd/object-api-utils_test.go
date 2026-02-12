@@ -19,18 +19,146 @@ package cmd
 
 import (
 	"bytes"
+	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
+	"net/http/httptest"
+	"path"
 	"reflect"
+	"runtime"
 	"strconv"
 	"testing"
 
 	"github.com/klauspost/compress/s2"
+	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/config/compress"
 	"github.com/minio/minio/internal/crypto"
-	"github.com/minio/pkg/trie"
+	"github.com/minio/pkg/v3/trie"
 )
+
+func pathJoinOld(elem ...string) string {
+	trailingSlash := ""
+	if len(elem) > 0 {
+		if hasSuffixByte(elem[len(elem)-1], SlashSeparatorChar) {
+			trailingSlash = SlashSeparator
+		}
+	}
+	return path.Join(elem...) + trailingSlash
+}
+
+func concatNaive(ss ...string) string {
+	rs := ss[0]
+	for i := 1; i < len(ss); i++ {
+		rs += ss[i]
+	}
+	return rs
+}
+
+func benchmark(b *testing.B, data []string) {
+	b.Run("concat naive", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		for b.Loop() {
+			concatNaive(data...)
+		}
+	})
+	b.Run("concat fast", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		for b.Loop() {
+			concat(data...)
+		}
+	})
+}
+
+func BenchmarkConcatImplementation(b *testing.B) {
+	data := make([]string, 2)
+	rng := rand.New(rand.NewSource(0))
+	for i := range 2 {
+		var tmp [16]byte
+		rng.Read(tmp[:])
+		data[i] = hex.EncodeToString(tmp[:])
+	}
+	b.ResetTimer()
+	benchmark(b, data)
+}
+
+func BenchmarkPathJoinOld(b *testing.B) {
+	b.Run("PathJoin", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+
+		for b.Loop() {
+			pathJoinOld("volume", "path/path/path")
+		}
+	})
+}
+
+func BenchmarkPathJoin(b *testing.B) {
+	b.Run("PathJoin", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+
+		for b.Loop() {
+			pathJoin("volume", "path/path/path")
+		}
+	})
+}
+
+// Wrapper
+func TestPathTraversalExploit(t *testing.T) {
+	if runtime.GOOS != globalWindowsOSName {
+		t.Skip()
+	}
+	defer DetectTestLeak(t)()
+	ExecExtendedObjectLayerAPITest(t, testPathTraversalExploit, []string{"PutObject"})
+}
+
+// testPathTraversal exploit test, exploits path traversal on windows
+// with following object names "\\../.minio.sys/config/iam/${username}/identity.json"
+// #16852
+func testPathTraversalExploit(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
+	credentials auth.Credentials, t *testing.T,
+) {
+	if err := newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatalf("Initializing config.json failed")
+	}
+
+	objectName := `\../.minio.sys/config/hello.txt`
+
+	// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
+	rec := httptest.NewRecorder()
+	// construct HTTP request for Get Object end point.
+	req, err := newTestSignedRequestV4(http.MethodPut, getPutObjectURL("", bucketName, objectName),
+		int64(5), bytes.NewReader([]byte("hello")), credentials.AccessKey, credentials.SecretKey, map[string]string{})
+	if err != nil {
+		t.Fatalf("failed to create HTTP request for Put Object: <ERROR> %v", err)
+	}
+
+	// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic of the handler.
+	// Call the ServeHTTP to execute the handler.
+	apiRouter.ServeHTTP(rec, req)
+
+	ctx, cancel := context.WithCancel(GlobalContext)
+	defer cancel()
+
+	// Now check if we actually wrote to backend (regardless of the response
+	// returned by the server).
+	z := obj.(*erasureServerPools)
+	xl := z.serverPools[0].sets[0]
+	erasureDisks := xl.getDisks()
+	parts, errs := readAllFileInfo(ctx, erasureDisks, "", bucketName, objectName, "", false, false)
+	for i := range parts {
+		if errs[i] == nil {
+			if parts[i].Name == objectName {
+				t.Errorf("path traversal allowed to allow writing to minioMetaBucket: %s", instanceType)
+			}
+		}
+	}
+}
 
 // Tests validate bucket name.
 func TestIsValidBucketName(t *testing.T) {
@@ -60,7 +188,7 @@ func TestIsValidBucketName(t *testing.T) {
 		{"192.168.1.1", false},
 		{"$this-is-not-valid-too", false},
 		{"contains-$-dollar", false},
-		{"contains-^-carret", false},
+		{"contains-^-caret", false},
 		{"contains-$-dollar", false},
 		{"contains-$-dollar", false},
 		{"......", false},
@@ -106,7 +234,7 @@ func TestIsValidObjectName(t *testing.T) {
 		{"117Gn8rfHL2ACARPAhaFd0AGzic9pUbIA/5OCn5A", true},
 		{"SHØRT", true},
 		{"f*le", true},
-		{"contains-^-carret", true},
+		{"contains-^-caret", true},
 		{"contains-|-pipe", true},
 		{"contains-`-tick", true},
 		{"..test", true},
@@ -320,35 +448,42 @@ func TestIsCompressed(t *testing.T) {
 	}{
 		0: {
 			objInfo: ObjectInfo{
-				UserDefined: map[string]string{"X-Minio-Internal-compression": compressionAlgorithmV1,
-					"content-type": "application/octet-stream",
-					"etag":         "b3ff3ef3789147152fbfbc50efba4bfd-2"},
+				UserDefined: map[string]string{
+					"X-Minio-Internal-compression": compressionAlgorithmV1,
+					"content-type":                 "application/octet-stream",
+					"etag":                         "b3ff3ef3789147152fbfbc50efba4bfd-2",
+				},
 			},
 			result: true,
 		},
 		1: {
 			objInfo: ObjectInfo{
-				UserDefined: map[string]string{"X-Minio-Internal-compression": compressionAlgorithmV2,
-					"content-type": "application/octet-stream",
-					"etag":         "b3ff3ef3789147152fbfbc50efba4bfd-2"},
+				UserDefined: map[string]string{
+					"X-Minio-Internal-compression": compressionAlgorithmV2,
+					"content-type":                 "application/octet-stream",
+					"etag":                         "b3ff3ef3789147152fbfbc50efba4bfd-2",
+				},
 			},
 			result: true,
 		},
 		2: {
 			objInfo: ObjectInfo{
-				UserDefined: map[string]string{"X-Minio-Internal-compression": "unknown/compression/type",
-					"content-type": "application/octet-stream",
-					"etag":         "b3ff3ef3789147152fbfbc50efba4bfd-2"},
+				UserDefined: map[string]string{
+					"X-Minio-Internal-compression": "unknown/compression/type",
+					"content-type":                 "application/octet-stream",
+					"etag":                         "b3ff3ef3789147152fbfbc50efba4bfd-2",
+				},
 			},
 			result: true,
 			err:    true,
 		},
 		3: {
 			objInfo: ObjectInfo{
-				UserDefined: map[string]string{"X-Minio-Internal-compression": compressionAlgorithmV2,
-					"content-type": "application/octet-stream",
-					"etag":         "b3ff3ef3789147152fbfbc50efba4bfd-2",
-					crypto.MetaIV:  "yes",
+				UserDefined: map[string]string{
+					"X-Minio-Internal-compression": compressionAlgorithmV2,
+					"content-type":                 "application/octet-stream",
+					"etag":                         "b3ff3ef3789147152fbfbc50efba4bfd-2",
+					crypto.MetaIV:                  "yes",
 				},
 			},
 			result: true,
@@ -356,16 +491,20 @@ func TestIsCompressed(t *testing.T) {
 		},
 		4: {
 			objInfo: ObjectInfo{
-				UserDefined: map[string]string{"X-Minio-Internal-XYZ": "klauspost/compress/s2",
-					"content-type": "application/octet-stream",
-					"etag":         "b3ff3ef3789147152fbfbc50efba4bfd-2"},
+				UserDefined: map[string]string{
+					"X-Minio-Internal-XYZ": "klauspost/compress/s2",
+					"content-type":         "application/octet-stream",
+					"etag":                 "b3ff3ef3789147152fbfbc50efba4bfd-2",
+				},
 			},
 			result: false,
 		},
 		5: {
 			objInfo: ObjectInfo{
-				UserDefined: map[string]string{"content-type": "application/octet-stream",
-					"etag": "b3ff3ef3789147152fbfbc50efba4bfd-2"},
+				UserDefined: map[string]string{
+					"content-type": "application/octet-stream",
+					"etag":         "b3ff3ef3789147152fbfbc50efba4bfd-2",
+				},
 			},
 			result: false,
 		},
@@ -468,10 +607,11 @@ func TestGetActualSize(t *testing.T) {
 	}{
 		{
 			objInfo: ObjectInfo{
-				UserDefined: map[string]string{"X-Minio-Internal-compression": "klauspost/compress/s2",
-					"X-Minio-Internal-actual-size": "100000001",
+				UserDefined: map[string]string{
+					"X-Minio-Internal-compression": "klauspost/compress/s2",
 					"content-type":                 "application/octet-stream",
-					"etag":                         "b3ff3ef3789147152fbfbc50efba4bfd-2"},
+					"etag":                         "b3ff3ef3789147152fbfbc50efba4bfd-2",
+				},
 				Parts: []ObjectPartInfo{
 					{
 						Size:       39235668,
@@ -482,25 +622,32 @@ func TestGetActualSize(t *testing.T) {
 						ActualSize: 32891137,
 					},
 				},
+				Size: 100000001,
 			},
 			result: 100000001,
 		},
 		{
 			objInfo: ObjectInfo{
-				UserDefined: map[string]string{"X-Minio-Internal-compression": "klauspost/compress/s2",
+				UserDefined: map[string]string{
+					"X-Minio-Internal-compression": "klauspost/compress/s2",
 					"X-Minio-Internal-actual-size": "841",
 					"content-type":                 "application/octet-stream",
-					"etag":                         "b3ff3ef3789147152fbfbc50efba4bfd-2"},
+					"etag":                         "b3ff3ef3789147152fbfbc50efba4bfd-2",
+				},
 				Parts: []ObjectPartInfo{},
+				Size:  841,
 			},
 			result: 841,
 		},
 		{
 			objInfo: ObjectInfo{
-				UserDefined: map[string]string{"X-Minio-Internal-compression": "klauspost/compress/s2",
-					"content-type": "application/octet-stream",
-					"etag":         "b3ff3ef3789147152fbfbc50efba4bfd-2"},
+				UserDefined: map[string]string{
+					"X-Minio-Internal-compression": "klauspost/compress/s2",
+					"content-type":                 "application/octet-stream",
+					"etag":                         "b3ff3ef3789147152fbfbc50efba4bfd-2",
+				},
 				Parts: []ObjectPartInfo{},
+				Size:  100,
 			},
 			result: -1,
 		},
@@ -576,7 +723,7 @@ func TestGetCompressedOffsets(t *testing.T) {
 		},
 	}
 	for i, test := range testCases {
-		startOffset, snappyStartOffset, firstPart := getCompressedOffsets(test.objInfo, test.offset)
+		startOffset, snappyStartOffset, firstPart, _, _ := getCompressedOffsets(test.objInfo, test.offset, nil)
 		if startOffset != test.startOffset {
 			t.Errorf("Test %d - expected startOffset %d but received %d",
 				i, test.startOffset, startOffset)
@@ -594,19 +741,20 @@ func TestGetCompressedOffsets(t *testing.T) {
 
 func TestS2CompressReader(t *testing.T) {
 	tests := []struct {
-		name string
-		data []byte
+		name    string
+		data    []byte
+		wantIdx bool
 	}{
 		{name: "empty", data: nil},
-		{name: "small", data: []byte("hello, world")},
-		{name: "large", data: bytes.Repeat([]byte("hello, world"), 1000)},
+		{name: "small", data: []byte("hello, world!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")},
+		{name: "large", data: bytes.Repeat([]byte("hello, world"), 1000000), wantIdx: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			buf := make([]byte, 100) // make small buffer to ensure multiple reads are required for large case
 
-			r := newS2CompressReader(bytes.NewReader(tt.data), int64(len(tt.data)))
+			r, idxCB := newS2CompressReader(bytes.NewReader(tt.data), int64(len(tt.data)), false)
 			defer r.Close()
 
 			var rdrBuf bytes.Buffer
@@ -614,7 +762,26 @@ func TestS2CompressReader(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-
+			r.Close()
+			idx := idxCB()
+			if !tt.wantIdx && len(idx) > 0 {
+				t.Errorf("index returned above threshold")
+			}
+			if tt.wantIdx {
+				if idx == nil {
+					t.Errorf("no index returned")
+				}
+				var index s2.Index
+				_, err = index.Load(s2.RestoreIndexHeaders(idx))
+				if err != nil {
+					t.Errorf("error loading index: %v", err)
+				}
+				t.Log("size:", len(idx))
+				t.Log(string(index.JSON()))
+				if index.TotalUncompressed != int64(len(tt.data)) {
+					t.Errorf("Expected size %d, got %d", len(tt.data), index.TotalUncompressed)
+				}
+			}
 			var stdBuf bytes.Buffer
 			w := s2.NewWriter(&stdBuf)
 			_, err = io.CopyBuffer(w, bytes.NewReader(tt.data), buf)
@@ -645,5 +812,72 @@ func TestS2CompressReader(t *testing.T) {
 				t.Errorf("roundtrip failed\n\t%q\n\t%q", tt.data, decBuf.Bytes())
 			}
 		})
+	}
+}
+
+func Test_pathNeedsClean(t *testing.T) {
+	type pathTest struct {
+		path, result string
+	}
+
+	cleantests := []pathTest{
+		// Already clean
+		{"", "."},
+		{"abc", "abc"},
+		{"abc/def", "abc/def"},
+		{"a/b/c", "a/b/c"},
+		{".", "."},
+		{"..", ".."},
+		{"../..", "../.."},
+		{"../../abc", "../../abc"},
+		{"/abc", "/abc"},
+		{"/abc/def", "/abc/def"},
+		{"/", "/"},
+
+		// Remove trailing slash
+		{"abc/", "abc"},
+		{"abc/def/", "abc/def"},
+		{"a/b/c/", "a/b/c"},
+		{"./", "."},
+		{"../", ".."},
+		{"../../", "../.."},
+		{"/abc/", "/abc"},
+
+		// Remove doubled slash
+		{"abc//def//ghi", "abc/def/ghi"},
+		{"//abc", "/abc"},
+		{"///abc", "/abc"},
+		{"//abc//", "/abc"},
+		{"abc//", "abc"},
+
+		// Remove . elements
+		{"abc/./def", "abc/def"},
+		{"/./abc/def", "/abc/def"},
+		{"abc/.", "abc"},
+
+		// Remove .. elements
+		{"abc/def/ghi/../jkl", "abc/def/jkl"},
+		{"abc/def/../ghi/../jkl", "abc/jkl"},
+		{"abc/def/..", "abc"},
+		{"abc/def/../..", "."},
+		{"/abc/def/../..", "/"},
+		{"abc/def/../../..", ".."},
+		{"/abc/def/../../..", "/"},
+		{"abc/def/../../../ghi/jkl/../../../mno", "../../mno"},
+
+		// Combinations
+		{"abc/./../def", "def"},
+		{"abc//./../def", "def"},
+		{"abc/../../././../def", "../../def"},
+	}
+	for _, test := range cleantests {
+		want := test.path != test.result
+		got := pathNeedsClean([]byte(test.path))
+		if !got {
+			t.Logf("no clean: %q", test.path)
+		}
+		if want && !got {
+			t.Errorf("input: %q, want %v, got %v", test.path, want, got)
+		}
 	}
 }

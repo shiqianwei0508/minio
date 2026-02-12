@@ -17,13 +17,15 @@
 
 package main // import "github.com/minio/minio"
 
+//go:generate go install tool
+
 import (
 	"os"
 
-	minio "github.com/minio/minio/cmd"
+	// MUST be first import.
+	_ "github.com/minio/minio/internal/init"
 
-	// Import gateway
-	_ "github.com/minio/minio/cmd/gateway"
+	minio "github.com/minio/minio/cmd"
 )
 
 func main() {

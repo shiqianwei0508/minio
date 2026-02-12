@@ -95,7 +95,7 @@ func doesPolicySignatureV2Match(formValues http.Header) (auth.Credentials, APIEr
 // Escape encodedQuery string into unescaped list of query params, returns error
 // if any while unescaping the values.
 func unescapeQueries(encodedQuery string) (unescapedQueries []string, err error) {
-	for _, query := range strings.Split(encodedQuery, "&") {
+	for query := range strings.SplitSeq(encodedQuery, "&") {
 		var unescapedQuery string
 		unescapedQuery, err = url.QueryUnescape(query)
 		if err != nil {
@@ -107,7 +107,8 @@ func unescapeQueries(encodedQuery string) (unescapedQueries []string, err error)
 }
 
 // doesPresignV2SignatureMatch - Verify query headers with presigned signature
-//     - http://docs.aws.amazon.com/AmazonS3/latest/dev/RESTAuthentication.html#RESTAuthenticationQueryStringAuth
+//   - http://docs.aws.amazon.com/AmazonS3/latest/dev/RESTAuthentication.html#RESTAuthenticationQueryStringAuth
+//
 // returns ErrNone if matches. S3 errors otherwise.
 func doesPresignV2SignatureMatch(r *http.Request) APIErrorCode {
 	// r.RequestURI will have raw encoded URI as sent by the client.
@@ -181,6 +182,8 @@ func doesPresignV2SignatureMatch(r *http.Request) APIErrorCode {
 		return ErrSignatureDoesNotMatch
 	}
 
+	r.Form.Del(xhttp.Expires)
+
 	return ErrNone
 }
 
@@ -196,7 +199,7 @@ func getReqAccessKeyV2(r *http.Request) (auth.Credentials, bool, APIErrorCode) {
 		return auth.Credentials{}, false, ErrMissingFields
 	}
 
-	// Then will be splitting on ":", this will seprate `AWSAccessKeyId` and `Signature` string.
+	// Then will be splitting on ":", this will separate `AWSAccessKeyId` and `Signature` string.
 	keySignFields := strings.Split(strings.TrimSpace(authFields[1]), ":")
 	if len(keySignFields) != 2 {
 		return auth.Credentials{}, false, ErrMissingFields

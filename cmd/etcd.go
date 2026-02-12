@@ -47,6 +47,7 @@ func saveKeyEtcdWithTTL(ctx context.Context, client *etcd.Client, key string, da
 		return etcdErrToErr(err, client.Endpoints())
 	}
 	_, err = client.Put(timeoutCtx, key, string(data), etcd.WithLease(lease.ID))
+	etcdLogIf(ctx, err)
 	return etcdErrToErr(err, client.Endpoints())
 }
 
@@ -57,6 +58,7 @@ func saveKeyEtcd(ctx context.Context, client *etcd.Client, key string, data []by
 		return saveKeyEtcdWithTTL(ctx, client, key, data, opts[0].ttl)
 	}
 	_, err := client.Put(timeoutCtx, key, string(data))
+	etcdLogIf(ctx, err)
 	return etcdErrToErr(err, client.Endpoints())
 }
 
@@ -65,6 +67,7 @@ func deleteKeyEtcd(ctx context.Context, client *etcd.Client, key string) error {
 	defer cancel()
 
 	_, err := client.Delete(timeoutCtx, key)
+	etcdLogIf(ctx, err)
 	return etcdErrToErr(err, client.Endpoints())
 }
 
@@ -73,6 +76,7 @@ func readKeyEtcd(ctx context.Context, client *etcd.Client, key string) ([]byte, 
 	defer cancel()
 	resp, err := client.Get(timeoutCtx, key)
 	if err != nil {
+		etcdLogOnceIf(ctx, err, "etcd-retrieve-keys")
 		return nil, etcdErrToErr(err, client.Endpoints())
 	}
 	if resp.Count == 0 {

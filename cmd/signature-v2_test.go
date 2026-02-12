@@ -18,6 +18,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -31,7 +32,7 @@ func TestResourceListSorting(t *testing.T) {
 	sortedResourceList := make([]string, len(resourceList))
 	copy(sortedResourceList, resourceList)
 	sort.Strings(sortedResourceList)
-	for i := 0; i < len(resourceList); i++ {
+	for i := range resourceList {
 		if resourceList[i] != sortedResourceList[i] {
 			t.Errorf("Expected resourceList[%d] = \"%s\", resourceList is not correctly sorted.", i, sortedResourceList[i])
 			break
@@ -41,7 +42,10 @@ func TestResourceListSorting(t *testing.T) {
 
 // Tests presigned v2 signature.
 func TestDoesPresignedV2SignatureMatch(t *testing.T) {
-	obj, fsDir, err := prepareFS()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	obj, fsDir, err := prepareFS(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,13 +159,15 @@ func TestDoesPresignedV2SignatureMatch(t *testing.T) {
 				t.Errorf("(%d) expected to get success, instead got %s", i, niceError(errCode))
 			}
 		}
-
 	}
 }
 
 // TestValidateV2AuthHeader - Tests validate the logic of V2 Authorization header validator.
 func TestValidateV2AuthHeader(t *testing.T) {
-	obj, fsDir, err := prepareFS()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	obj, fsDir, err := prepareFS(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,14 +184,12 @@ func TestValidateV2AuthHeader(t *testing.T) {
 		// Test case - 1.
 		// Case with empty V2AuthString.
 		{
-
 			authString:    "",
 			expectedError: ErrAuthHeaderEmpty,
 		},
 		// Test case - 2.
 		// Test case with `signV2Algorithm` ("AWS") not being the prefix.
 		{
-
 			authString:    "NoV2Prefix",
 			expectedError: ErrSignatureVersionNotSupported,
 		},
@@ -194,28 +198,24 @@ func TestValidateV2AuthHeader(t *testing.T) {
 		// below is the correct format of V2 Authorization header.
 		// Authorization = "AWS" + " " + AWSAccessKeyId + ":" + Signature
 		{
-
 			authString:    signV2Algorithm,
 			expectedError: ErrMissingFields,
 		},
 		// Test case - 4.
 		// Test case with signature part missing.
 		{
-
 			authString:    fmt.Sprintf("%s %s", signV2Algorithm, accessID),
 			expectedError: ErrMissingFields,
 		},
 		// Test case - 5.
 		// Test case with wrong accessID.
 		{
-
 			authString:    fmt.Sprintf("%s %s:%s", signV2Algorithm, "InvalidAccessID", "signature"),
 			expectedError: ErrInvalidAccessKeyID,
 		},
 		// Test case - 6.
 		// Case with right accessID and format.
 		{
-
 			authString:    fmt.Sprintf("%s %s:%s", signV2Algorithm, accessID, "signature"),
 			expectedError: ErrNone,
 		},
@@ -223,7 +223,6 @@ func TestValidateV2AuthHeader(t *testing.T) {
 
 	for i, testCase := range testCases {
 		t.Run(fmt.Sprintf("Case %d AuthStr \"%s\".", i+1, testCase.authString), func(t *testing.T) {
-
 			req := &http.Request{
 				Header: make(http.Header),
 				URL:    &url.URL{},
@@ -236,11 +235,13 @@ func TestValidateV2AuthHeader(t *testing.T) {
 			}
 		})
 	}
-
 }
 
 func TestDoesPolicySignatureV2Match(t *testing.T) {
-	obj, fsDir, err := prepareFS()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	obj, fsDir, err := prepareFS(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

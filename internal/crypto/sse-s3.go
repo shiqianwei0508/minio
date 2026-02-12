@@ -46,7 +46,8 @@ func (sses3) String() string { return "SSE-S3" }
 
 func (sses3) IsRequested(h http.Header) bool {
 	_, ok := h[xhttp.AmzServerSideEncryption]
-	return ok && strings.ToLower(h.Get(xhttp.AmzServerSideEncryption)) != xhttp.AmzEncryptionKMS // Return only true if the SSE header is specified and does not contain the SSE-KMS value
+	// Return only true if the SSE header is specified and does not contain the SSE-KMS value
+	return ok && !strings.EqualFold(h.Get(xhttp.AmzServerSideEncryption), xhttp.AmzEncryptionKMS)
 }
 
 // ParseHTTP parses the SSE-S3 related HTTP headers and checks
@@ -70,17 +71,48 @@ func (sses3) IsEncrypted(metadata map[string]string) bool {
 // UnsealObjectKey extracts and decrypts the sealed object key
 // from the metadata using KMS and returns the decrypted object
 // key.
-func (s3 sses3) UnsealObjectKey(KMS kms.KMS, metadata map[string]string, bucket, object string) (key ObjectKey, err error) {
+func (s3 sses3) UnsealObjectKey(k *kms.KMS, metadata map[string]string, bucket, object string) (key ObjectKey, err error) {
+	if k == nil {
+		return key, Errorf("KMS not configured")
+	}
 	keyID, kmsKey, sealedKey, err := s3.ParseMetadata(metadata)
 	if err != nil {
 		return key, err
 	}
-	unsealKey, err := KMS.DecryptKey(keyID, kmsKey, kms.Context{bucket: path.Join(bucket, object)})
+	unsealKey, err := k.Decrypt(context.TODO(), &kms.DecryptRequest{
+		Name:           keyID,
+		Ciphertext:     kmsKey,
+		AssociatedData: kms.Context{bucket: path.Join(bucket, object)},
+	})
 	if err != nil {
 		return key, err
 	}
-	err = key.Unseal(unsealKey[:], sealedKey, s3.String(), bucket, object)
+	err = key.Unseal(unsealKey, sealedKey, s3.String(), bucket, object)
 	return key, err
+}
+
+// UnsealObjectsKeys extracts and decrypts all sealed object keys
+// from the metadata using the KMS and returns the decrypted object
+// keys.
+//
+// The metadata, buckets and objects slices must have the same length.
+func (s3 sses3) UnsealObjectKeys(ctx context.Context, k *kms.KMS, metadata []map[string]string, buckets, objects []string) ([]ObjectKey, error) {
+	if k == nil {
+		return nil, Errorf("KMS not configured")
+	}
+
+	if len(metadata) != len(buckets) || len(metadata) != len(objects) {
+		return nil, Errorf("invalid metadata/object count: %d != %d != %d", len(metadata), len(buckets), len(objects))
+	}
+	keys := make([]ObjectKey, 0, len(metadata))
+	for i := range metadata {
+		key, err := s3.UnsealObjectKey(k, metadata[i], buckets[i], objects[i])
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	return keys, nil
 }
 
 // CreateMetadata encodes the sealed object key into the metadata and returns
@@ -92,7 +124,7 @@ func (sses3) CreateMetadata(metadata map[string]string, keyID string, kmsKey []b
 		logger.CriticalIf(context.Background(), Errorf("The seal algorithm '%s' is invalid for SSE-S3", sealedKey.Algorithm))
 	}
 
-	// There are two possibilites:
+	// There are two possibilities:
 	// - We use a KMS -> There must be non-empty key ID and a KMS data key.
 	// - We use a K/V -> There must be no key ID and no KMS data key.
 	// Otherwise, the caller has passed an invalid argument combination.
@@ -138,7 +170,7 @@ func (sses3) ParseMetadata(metadata map[string]string) (keyID string, kmsKey []b
 		return keyID, kmsKey, sealedKey, Errorf("The object metadata is missing the internal sealed key for SSE-S3")
 	}
 
-	// There are two possibilites:
+	// There are two possibilities:
 	// - We use a KMS -> There must be a key ID and a KMS data key.
 	// - We use a K/V -> There must be no key ID and no KMS data key.
 	// Otherwise, the metadata is corrupted.

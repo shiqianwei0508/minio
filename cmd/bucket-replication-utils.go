@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2023 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -19,13 +19,21 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"maps"
+	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/replication"
+	"github.com/minio/minio/internal/crypto"
+	xhttp "github.com/minio/minio/internal/http"
 )
 
 //go:generate msgp -file=$GOFILE
@@ -34,6 +42,7 @@ import (
 type replicatedTargetInfo struct {
 	Arn                   string
 	Size                  int64
+	Duration              time.Duration
 	ReplicationAction     replicationAction // full or metadata only
 	OpType                replication.Type  // whether incoming replication, existing object, healing etc..
 	ReplicationStatus     replication.StatusType
@@ -41,6 +50,9 @@ type replicatedTargetInfo struct {
 	VersionPurgeStatus    VersionPurgeStatusType
 	ResyncTimestamp       string
 	ReplicationResynced   bool // true only if resync attempted for this target
+	endpoint              string
+	secure                bool
+	Err                   error // replication error if any
 }
 
 // Empty returns true for a target if arn is empty
@@ -114,16 +126,16 @@ func (ri replicatedInfos) VersionPurgeStatus() VersionPurgeStatusType {
 	completed := 0
 	for _, v := range ri.Targets {
 		switch v.VersionPurgeStatus {
-		case Failed:
-			return Failed
-		case Complete:
+		case replication.VersionPurgeFailed:
+			return replication.VersionPurgeFailed
+		case replication.VersionPurgeComplete:
 			completed++
 		}
 	}
 	if completed == len(ri.Targets) {
-		return Complete
+		return replication.VersionPurgeComplete
 	}
-	return Pending
+	return replication.VersionPurgePending
 }
 
 func (ri replicatedInfos) VersionPurgeStatusInternal() string {
@@ -156,23 +168,37 @@ func (ri replicatedInfos) Action() replicationAction {
 var replStatusRegex = regexp.MustCompile(`([^=].*?)=([^,].*?);`)
 
 // TargetReplicationStatus - returns replication status of a target
-func (o *ObjectInfo) TargetReplicationStatus(arn string) (status replication.StatusType) {
-	repStatMatches := replStatusRegex.FindAllStringSubmatch(o.ReplicationStatusInternal, -1)
+func (ri ReplicateObjectInfo) TargetReplicationStatus(arn string) (status replication.StatusType) {
+	repStatMatches := replStatusRegex.FindAllStringSubmatch(ri.ReplicationStatusInternal, -1)
 	for _, repStatMatch := range repStatMatches {
 		if len(repStatMatch) != 3 {
-			return
+			return status
 		}
 		if repStatMatch[1] == arn {
 			return replication.StatusType(repStatMatch[2])
 		}
 	}
-	return
+	return status
+}
+
+// TargetReplicationStatus - returns replication status of a target
+func (o ObjectInfo) TargetReplicationStatus(arn string) (status replication.StatusType) {
+	repStatMatches := replStatusRegex.FindAllStringSubmatch(o.ReplicationStatusInternal, -1)
+	for _, repStatMatch := range repStatMatches {
+		if len(repStatMatch) != 3 {
+			return status
+		}
+		if repStatMatch[1] == arn {
+			return replication.StatusType(repStatMatch[2])
+		}
+	}
+	return status
 }
 
 type replicateTargetDecision struct {
 	Replicate   bool   // Replicate to this target
 	Synchronous bool   // Synchronous replication configured.
-	Arn         string //ARN of replication target
+	Arn         string // ARN of replication target
 	ID          string
 }
 
@@ -194,8 +220,8 @@ type ReplicateDecision struct {
 	targetsMap map[string]replicateTargetDecision
 }
 
-// ReplicateAny returns true if atleast one target qualifies for replication
-func (d *ReplicateDecision) ReplicateAny() bool {
+// ReplicateAny returns true if at least one target qualifies for replication
+func (d ReplicateDecision) ReplicateAny() bool {
 	for _, t := range d.targetsMap {
 		if t.Replicate {
 			return true
@@ -204,8 +230,8 @@ func (d *ReplicateDecision) ReplicateAny() bool {
 	return false
 }
 
-// Synchronous returns true if atleast one target qualifies for synchronous replication
-func (d *ReplicateDecision) Synchronous() bool {
+// Synchronous returns true if at least one target qualifies for synchronous replication
+func (d ReplicateDecision) Synchronous() bool {
 	for _, t := range d.targetsMap {
 		if t.Synchronous {
 			return true
@@ -214,7 +240,7 @@ func (d *ReplicateDecision) Synchronous() bool {
 	return false
 }
 
-func (d *ReplicateDecision) String() string {
+func (d ReplicateDecision) String() string {
 	b := new(bytes.Buffer)
 	for key, value := range d.targetsMap {
 		fmt.Fprintf(b, "%s=%s,", key, value.String())
@@ -231,7 +257,7 @@ func (d *ReplicateDecision) Set(t replicateTargetDecision) {
 }
 
 // PendingStatus returns a stringified representation of internal replication status with all targets marked as `PENDING`
-func (d *ReplicateDecision) PendingStatus() string {
+func (d ReplicateDecision) PendingStatus() string {
 	b := new(bytes.Buffer)
 	for _, k := range d.targetsMap {
 		if k.Replicate {
@@ -247,11 +273,11 @@ type ResyncDecision struct {
 }
 
 // Empty returns true if no targets with resync decision present
-func (r *ResyncDecision) Empty() bool {
+func (r ResyncDecision) Empty() bool {
 	return r.targets == nil
 }
 
-func (r *ResyncDecision) mustResync() bool {
+func (r ResyncDecision) mustResync() bool {
 	for _, v := range r.targets {
 		if v.Replicate {
 			return true
@@ -260,15 +286,12 @@ func (r *ResyncDecision) mustResync() bool {
 	return false
 }
 
-func (r *ResyncDecision) mustResyncTarget(tgtArn string) bool {
+func (r ResyncDecision) mustResyncTarget(tgtArn string) bool {
 	if r.targets == nil {
 		return false
 	}
 	v, ok := r.targets[tgtArn]
-	if ok && v.Replicate {
-		return true
-	}
-	return false
+	return ok && v.Replicate
 }
 
 // ResyncTargetDecision is struct that represents resync decision for this target
@@ -282,38 +305,29 @@ var errInvalidReplicateDecisionFormat = fmt.Errorf("ReplicateDecision has invali
 
 // parse k-v pairs of target ARN to stringified ReplicateTargetDecision delimited by ',' into a
 // ReplicateDecision struct
-func parseReplicateDecision(s string) (r ReplicateDecision, err error) {
+func parseReplicateDecision(ctx context.Context, bucket, s string) (r ReplicateDecision, err error) {
 	r = ReplicateDecision{
 		targetsMap: make(map[string]replicateTargetDecision),
 	}
 	if len(s) == 0 {
-		return
+		return r, err
 	}
-	pairs := strings.Split(s, ",")
-	for _, p := range pairs {
+	for p := range strings.SplitSeq(s, ",") {
+		if p == "" {
+			continue
+		}
 		slc := strings.Split(p, "=")
 		if len(slc) != 2 {
 			return r, errInvalidReplicateDecisionFormat
 		}
-		tgtStr := strings.TrimPrefix(slc[1], "\"")
-		tgtStr = strings.TrimSuffix(tgtStr, "\"")
+		tgtStr := strings.TrimSuffix(strings.TrimPrefix(slc[1], `"`), `"`)
 		tgt := strings.Split(tgtStr, ";")
 		if len(tgt) != 4 {
 			return r, errInvalidReplicateDecisionFormat
 		}
-		var replicate, sync bool
-		var err error
-		replicate, err = strconv.ParseBool(tgt[0])
-		if err != nil {
-			return r, err
-		}
-		sync, err = strconv.ParseBool(tgt[1])
-		if err != nil {
-			return r, err
-		}
-		r.targetsMap[slc[0]] = replicateTargetDecision{Replicate: replicate, Synchronous: sync, Arn: tgt[2], ID: tgt[3]}
+		r.targetsMap[slc[0]] = replicateTargetDecision{Replicate: tgt[0] == "true", Synchronous: tgt[1] == "true", Arn: tgt[2], ID: tgt[3]}
 	}
-	return
+	return r, err
 }
 
 // ReplicationState represents internal replication state
@@ -323,7 +337,7 @@ type ReplicationState struct {
 	DeleteMarker              bool                   // represents DeleteMarker replication state
 	ReplicationTimeStamp      time.Time              // timestamp when last replication activity happened
 	ReplicationStatusInternal string                 // stringified representation of all replication activity
-	// VersionPurgeStatusInternal is internally in the format "arn1=PENDING;arn2=COMMPLETED;"
+	// VersionPurgeStatusInternal is internally in the format "arn1=PENDING;arn2=COMPLETED;"
 	VersionPurgeStatusInternal string                            // stringified representation of all version purge statuses
 	ReplicateDecisionStr       string                            // stringified representation of replication decision for each target
 	Targets                    map[string]replication.StatusType // map of ARN->replication status for ongoing replication activity
@@ -334,8 +348,6 @@ type ReplicationState struct {
 // Equal returns true if replication state is identical for version purge statuses and (replica)tion statuses.
 func (rs *ReplicationState) Equal(o ReplicationState) bool {
 	return rs.ReplicaStatus == o.ReplicaStatus &&
-		rs.ReplicaTimeStamp.Equal(o.ReplicaTimeStamp) &&
-		rs.ReplicationTimeStamp.Equal(o.ReplicationTimeStamp) &&
 		rs.ReplicationStatusInternal == o.ReplicationStatusInternal &&
 		rs.VersionPurgeStatusInternal == o.VersionPurgeStatusInternal
 }
@@ -351,7 +363,10 @@ func (rs *ReplicationState) CompositeReplicationStatus() (st replication.StatusT
 			replStatus := getCompositeReplicationStatus(rs.Targets)
 			// return REPLICA status if replica received timestamp is later than replication timestamp
 			// provided object replication completed for all targets.
-			if !rs.ReplicaTimeStamp.Equal(timeSentinel) && replStatus == replication.Completed && rs.ReplicaTimeStamp.After(rs.ReplicationTimeStamp) {
+			if rs.ReplicaTimeStamp.Equal(timeSentinel) || rs.ReplicaTimeStamp.IsZero() {
+				return replStatus
+			}
+			if replStatus == replication.Completed && rs.ReplicaTimeStamp.After(rs.ReplicationTimeStamp) {
 				return rs.ReplicaStatus
 			}
 			return replStatus
@@ -359,14 +374,14 @@ func (rs *ReplicationState) CompositeReplicationStatus() (st replication.StatusT
 	case !rs.ReplicaStatus.Empty():
 		return rs.ReplicaStatus
 	default:
-		return
+		return st
 	}
 }
 
 // CompositeVersionPurgeStatus returns overall replication purge status for the permanent delete being replicated.
 func (rs *ReplicationState) CompositeVersionPurgeStatus() VersionPurgeStatusType {
 	switch VersionPurgeStatusType(rs.VersionPurgeStatusInternal) {
-	case Pending, Complete, Failed: // for backward compatibility
+	case replication.VersionPurgePending, replication.VersionPurgeComplete, replication.VersionPurgeFailed: // for backward compatibility
 		return VersionPurgeStatusType(rs.VersionPurgeStatusInternal)
 	default:
 		return getCompositeVersionPurgeStatus(rs.PurgeTargets)
@@ -464,21 +479,21 @@ func getCompositeVersionPurgeStatus(m map[string]VersionPurgeStatusType) Version
 	completed := 0
 	for _, v := range m {
 		switch v {
-		case Failed:
-			return Failed
-		case Complete:
+		case replication.VersionPurgeFailed:
+			return replication.VersionPurgeFailed
+		case replication.VersionPurgeComplete:
 			completed++
 		}
 	}
 	if completed == len(m) {
-		return Complete
+		return replication.VersionPurgeComplete
 	}
-	return Pending
+	return replication.VersionPurgePending
 }
 
 // getHealReplicateObjectInfo returns info needed by heal replication in ReplicateObjectInfo
-func getHealReplicateObjectInfo(objInfo ObjectInfo, rcfg replicationConfig) ReplicateObjectInfo {
-	oi := objInfo.Clone()
+func getHealReplicateObjectInfo(oi ObjectInfo, rcfg replicationConfig) ReplicateObjectInfo {
+	userDefined := cloneMSS(oi.UserDefined)
 	if rcfg.Config != nil && rcfg.Config.RoleArn != "" {
 		// For backward compatibility of objects pending/failed replication.
 		// Save replication related statuses in the new internal representation for
@@ -489,45 +504,73 @@ func getHealReplicateObjectInfo(objInfo ObjectInfo, rcfg replicationConfig) Repl
 		if !oi.VersionPurgeStatus.Empty() {
 			oi.VersionPurgeStatusInternal = fmt.Sprintf("%s=%s;", rcfg.Config.RoleArn, oi.VersionPurgeStatus)
 		}
-		for k, v := range oi.UserDefined {
-			switch {
-			case strings.EqualFold(k, ReservedMetadataPrefixLower+ReplicationReset):
-				delete(oi.UserDefined, k)
-				oi.UserDefined[targetResetHeader(rcfg.Config.RoleArn)] = v
+		for k, v := range userDefined {
+			if strings.EqualFold(k, ReservedMetadataPrefixLower+ReplicationReset) {
+				delete(userDefined, k)
+				userDefined[targetResetHeader(rcfg.Config.RoleArn)] = v
 			}
 		}
 	}
+
 	var dsc ReplicateDecision
-	var tgtStatuses map[string]replication.StatusType
-	if oi.DeleteMarker {
+	if oi.DeleteMarker || !oi.VersionPurgeStatus.Empty() {
 		dsc = checkReplicateDelete(GlobalContext, oi.Bucket, ObjectToDelete{
-			ObjectName: oi.Name,
-			VersionID:  oi.VersionID,
-		}, oi, ObjectOptions{}, nil)
+			ObjectV: ObjectV{
+				ObjectName: oi.Name,
+				VersionID:  oi.VersionID,
+			},
+		}, oi, ObjectOptions{
+			Versioned:        globalBucketVersioningSys.PrefixEnabled(oi.Bucket, oi.Name),
+			VersionSuspended: globalBucketVersioningSys.PrefixSuspended(oi.Bucket, oi.Name),
+		}, nil)
 	} else {
-		dsc = mustReplicate(GlobalContext, oi.Bucket, oi.Name, getMustReplicateOptions(ObjectInfo{
-			UserDefined: oi.UserDefined,
-		}, replication.HealReplicationType, ObjectOptions{}))
+		dsc = mustReplicate(GlobalContext, oi.Bucket, oi.Name, getMustReplicateOptions(userDefined, oi.UserTags, "", replication.HealReplicationType, ObjectOptions{}))
 	}
-	tgtStatuses = replicationStatusesMap(oi.ReplicationStatusInternal)
 
-	existingObjResync := rcfg.Resync(GlobalContext, oi, &dsc, tgtStatuses)
+	tgtStatuses := replicationStatusesMap(oi.ReplicationStatusInternal)
+	purgeStatuses := versionPurgeStatusesMap(oi.VersionPurgeStatusInternal)
+	existingObjResync := rcfg.Resync(GlobalContext, oi, dsc, tgtStatuses)
+	tm, _ := time.Parse(time.RFC3339Nano, userDefined[ReservedMetadataPrefixLower+ReplicationTimestamp])
+	rstate := oi.ReplicationState()
+	rstate.ReplicateDecisionStr = dsc.String()
+	asz, _ := oi.GetActualSize()
 
-	return ReplicateObjectInfo{
-		ObjectInfo:        oi,
-		OpType:            replication.HealReplicationType,
-		Dsc:               dsc,
-		ExistingObjResync: existingObjResync,
-		TargetStatuses:    tgtStatuses,
+	r := ReplicateObjectInfo{
+		Name:                       oi.Name,
+		Size:                       oi.Size,
+		ActualSize:                 asz,
+		Bucket:                     oi.Bucket,
+		VersionID:                  oi.VersionID,
+		ETag:                       oi.ETag,
+		ModTime:                    oi.ModTime,
+		ReplicationStatus:          oi.ReplicationStatus,
+		ReplicationStatusInternal:  oi.ReplicationStatusInternal,
+		DeleteMarker:               oi.DeleteMarker,
+		VersionPurgeStatusInternal: oi.VersionPurgeStatusInternal,
+		VersionPurgeStatus:         oi.VersionPurgeStatus,
+
+		ReplicationState:     rstate,
+		OpType:               replication.HealReplicationType,
+		Dsc:                  dsc,
+		ExistingObjResync:    existingObjResync,
+		TargetStatuses:       tgtStatuses,
+		TargetPurgeStatuses:  purgeStatuses,
+		ReplicationTimestamp: tm,
+		SSEC:                 crypto.SSEC.IsEncrypted(oi.UserDefined),
+		UserTags:             oi.UserTags,
 	}
+	if r.SSEC {
+		r.Checksum = oi.Checksum
+	}
+	return r
 }
 
-// vID here represents the versionID client specified in request - need to distinguish between delete marker and delete marker deletion
-func (o *ObjectInfo) getReplicationState(dsc string, vID string, heal bool) ReplicationState {
+// ReplicationState - returns replication state using other internal replication metadata in ObjectInfo
+func (o ObjectInfo) ReplicationState() ReplicationState {
 	rs := ReplicationState{
 		ReplicationStatusInternal:  o.ReplicationStatusInternal,
 		VersionPurgeStatusInternal: o.VersionPurgeStatusInternal,
-		ReplicateDecisionStr:       dsc,
+		ReplicateDecisionStr:       o.replicationDecision,
 		Targets:                    make(map[string]replication.StatusType),
 		PurgeTargets:               make(map[string]VersionPurgeStatusType),
 		ResetStatusesMap:           make(map[string]string),
@@ -544,7 +587,7 @@ func (o *ObjectInfo) getReplicationState(dsc string, vID string, heal bool) Repl
 }
 
 // ReplicationState returns replication state using other internal replication metadata in ObjectToDelete
-func (o *ObjectToDelete) ReplicationState() ReplicationState {
+func (o ObjectToDelete) ReplicationState() ReplicationState {
 	r := ReplicationState{
 		ReplicationStatusInternal:  o.DeleteMarkerReplicationStatus,
 		VersionPurgeStatusInternal: o.VersionPurgeStatuses,
@@ -573,30 +616,196 @@ type ResyncTargetsInfo struct {
 
 // ResyncTarget is a struct representing the Target reset ID where target is identified by its Arn
 type ResyncTarget struct {
-	Arn     string `json:"arn"`
-	ResetID string `json:"resetid"`
+	Arn       string    `json:"arn"`
+	ResetID   string    `json:"resetid"`
+	StartTime time.Time `json:"startTime"`
+	EndTime   time.Time `json:"endTime"`
+	// Status of resync operation
+	ResyncStatus string `json:"resyncStatus,omitempty"`
+	// Completed size in bytes
+	ReplicatedSize int64 `json:"completedReplicationSize"`
+	// Failed size in bytes
+	FailedSize int64 `json:"failedReplicationSize"`
+	// Total number of failed operations
+	FailedCount int64 `json:"failedReplicationCount"`
+	// Total number of failed operations
+	ReplicatedCount int64 `json:"replicationCount"`
+	// Last bucket/object replicated.
+	Bucket string `json:"bucket,omitempty"`
+	Object string `json:"object,omitempty"`
 }
 
 // VersionPurgeStatusType represents status of a versioned delete or permanent delete w.r.t bucket replication
-type VersionPurgeStatusType string
+type VersionPurgeStatusType = replication.VersionPurgeStatusType
 
-const (
-	// Pending - versioned delete replication is pending.
-	Pending VersionPurgeStatusType = "PENDING"
-
-	// Complete - versioned delete replication is now complete, erase version on disk.
-	Complete VersionPurgeStatusType = "COMPLETE"
-
-	// Failed - versioned delete replication failed.
-	Failed VersionPurgeStatusType = "FAILED"
-)
-
-// Empty returns true if purge status was not set.
-func (v VersionPurgeStatusType) Empty() bool {
-	return string(v) == ""
+type replicationResyncer struct {
+	// map of bucket to their resync status
+	statusMap      map[string]BucketReplicationResyncStatus
+	workerSize     int
+	resyncCancelCh chan struct{}
+	workerCh       chan struct{}
+	sync.RWMutex
 }
 
-// Pending returns true if the version is pending purge.
-func (v VersionPurgeStatusType) Pending() bool {
-	return v == Pending || v == Failed
+const (
+	replicationDir      = ".replication"
+	resyncFileName      = "resync.bin"
+	resyncMetaFormat    = 1
+	resyncMetaVersionV1 = 1
+	resyncMetaVersion   = resyncMetaVersionV1
+)
+
+type resyncOpts struct {
+	bucket       string
+	arn          string
+	resyncID     string
+	resyncBefore time.Time
+}
+
+// ResyncStatusType status of resync operation
+type ResyncStatusType int
+
+const (
+	// NoResync - no resync in progress
+	NoResync ResyncStatusType = iota
+	// ResyncPending - resync pending
+	ResyncPending
+	// ResyncCanceled - resync canceled
+	ResyncCanceled
+	// ResyncStarted -  resync in progress
+	ResyncStarted
+	// ResyncCompleted -  resync finished
+	ResyncCompleted
+	// ResyncFailed -  resync failed
+	ResyncFailed
+)
+
+func (rt ResyncStatusType) isValid() bool {
+	return rt != NoResync
+}
+
+func (rt ResyncStatusType) String() string {
+	switch rt {
+	case ResyncStarted:
+		return "Ongoing"
+	case ResyncCompleted:
+		return "Completed"
+	case ResyncFailed:
+		return "Failed"
+	case ResyncPending:
+		return "Pending"
+	case ResyncCanceled:
+		return "Canceled"
+	default:
+		return ""
+	}
+}
+
+// TargetReplicationResyncStatus status of resync of bucket for a specific target
+type TargetReplicationResyncStatus struct {
+	StartTime  time.Time `json:"startTime" msg:"st"`
+	LastUpdate time.Time `json:"lastUpdated" msg:"lst"`
+	// Resync ID assigned to this reset
+	ResyncID string `json:"resyncID" msg:"id"`
+	// ResyncBeforeDate - resync all objects created prior to this date
+	ResyncBeforeDate time.Time `json:"resyncBeforeDate" msg:"rdt"`
+	// Status of resync operation
+	ResyncStatus ResyncStatusType `json:"resyncStatus" msg:"rst"`
+	// Failed size in bytes
+	FailedSize int64 `json:"failedReplicationSize"  msg:"fs"`
+	// Total number of failed operations
+	FailedCount int64 `json:"failedReplicationCount"  msg:"frc"`
+	// Completed size in bytes
+	ReplicatedSize int64 `json:"completedReplicationSize"  msg:"rs"`
+	// Total number of failed operations
+	ReplicatedCount int64 `json:"replicationCount"  msg:"rrc"`
+	// Last bucket/object replicated.
+	Bucket string `json:"-" msg:"bkt"`
+	Object string `json:"-" msg:"obj"`
+	Error  error  `json:"-" msg:"-"`
+}
+
+// BucketReplicationResyncStatus captures current replication resync status
+type BucketReplicationResyncStatus struct {
+	Version int `json:"version" msg:"v"`
+	// map of remote arn to their resync status for a bucket
+	TargetsMap map[string]TargetReplicationResyncStatus `json:"resyncMap,omitempty" msg:"brs"`
+	ID         int                                      `json:"id" msg:"id"`
+	LastUpdate time.Time                                `json:"lastUpdate" msg:"lu"`
+}
+
+func (rs *BucketReplicationResyncStatus) cloneTgtStats() (m map[string]TargetReplicationResyncStatus) {
+	m = make(map[string]TargetReplicationResyncStatus)
+	maps.Copy(m, rs.TargetsMap)
+	return m
+}
+
+func newBucketResyncStatus(bucket string) BucketReplicationResyncStatus {
+	return BucketReplicationResyncStatus{
+		TargetsMap: make(map[string]TargetReplicationResyncStatus),
+		Version:    resyncMetaVersion,
+	}
+}
+
+var contentRangeRegexp = regexp.MustCompile(`bytes ([0-9]+)-([0-9]+)/([0-9]+|\\*)`)
+
+// parse size from content-range header
+func parseSizeFromContentRange(h http.Header) (sz int64, err error) {
+	cr := h.Get(xhttp.ContentRange)
+	if cr == "" {
+		return sz, fmt.Errorf("Content-Range not set")
+	}
+	parts := contentRangeRegexp.FindStringSubmatch(cr)
+	if len(parts) != 4 {
+		return sz, fmt.Errorf("invalid Content-Range header %s", cr)
+	}
+	if parts[3] == "*" {
+		return -1, nil
+	}
+	var usz uint64
+	usz, err = strconv.ParseUint(parts[3], 10, 64)
+	if err != nil {
+		return sz, err
+	}
+	return int64(usz), nil
+}
+
+func extractReplicateDiffOpts(q url.Values) (opts madmin.ReplDiffOpts) {
+	opts.Verbose = q.Get("verbose") == "true"
+	opts.ARN = q.Get("arn")
+	opts.Prefix = q.Get("prefix")
+	return opts
+}
+
+const (
+	replicationMRFDir = bucketMetaPrefix + SlashSeparator + replicationDir + SlashSeparator + "mrf"
+	mrfMetaFormat     = 1
+	mrfMetaVersionV1  = 1
+	mrfMetaVersion    = mrfMetaVersionV1
+)
+
+// MRFReplicateEntry mrf entry to save to disk
+type MRFReplicateEntry struct {
+	Bucket     string `json:"bucket" msg:"b"`
+	Object     string `json:"object" msg:"o"`
+	versionID  string `json:"-"`
+	RetryCount int    `json:"retryCount" msg:"rc"`
+	sz         int64  `json:"-"`
+}
+
+// MRFReplicateEntries has the map of MRF entries to save to disk
+type MRFReplicateEntries struct {
+	Entries map[string]MRFReplicateEntry `json:"entries" msg:"e"`
+	Version int                          `json:"version" msg:"v"`
+}
+
+// ToMRFEntry returns the relevant info needed by MRF
+func (ri ReplicateObjectInfo) ToMRFEntry() MRFReplicateEntry {
+	return MRFReplicateEntry{
+		Bucket:     ri.Bucket,
+		Object:     ri.Name,
+		versionID:  ri.VersionID,
+		sz:         ri.Size,
+		RetryCount: int(ri.RetryCount),
+	}
 }

@@ -25,9 +25,13 @@ type HelpKV struct {
 	Description string `json:"description"`
 	Optional    bool   `json:"optional"`
 
-	// Indicates if the value contains sensitive info
-	// that shouldn't be exposed in certain apis
+	// Indicates if the value contains sensitive info that shouldn't be exposed
+	// in certain apis (such as Health Diagnostics/Callhome)
 	Sensitive bool `json:"-"`
+
+	// Indicates if the value is a secret such as a password that shouldn't be
+	// exposed by the server
+	Secret bool `json:"-"`
 
 	// Indicates if sub-sys supports multiple targets.
 	MultipleTargets bool `json:"multipleTargets"`
@@ -49,13 +53,34 @@ func (hkvs HelpKVS) Lookup(key string) (HelpKV, bool) {
 // DefaultComment used across all sub-systems.
 const DefaultComment = "optionally add a comment to this setting"
 
-// Region and Worm help is documented in default config
+// Region help is documented in default config
 var (
+	SiteHelp = HelpKVS{
+		HelpKV{
+			Key:         NameKey,
+			Type:        "string",
+			Description: `name for the site e.g. "cal-rack0"`,
+			Optional:    true,
+		},
+		HelpKV{
+			Key:         RegionKey,
+			Type:        "string",
+			Description: `name of the location of the server e.g. "us-west-1"`,
+			Optional:    true,
+		},
+		HelpKV{
+			Key:         Comment,
+			Type:        "sentence",
+			Description: DefaultComment,
+			Optional:    true,
+		},
+	}
+
 	RegionHelp = HelpKVS{
 		HelpKV{
 			Key:         RegionName,
 			Type:        "string",
-			Description: `name of the location of the server e.g. "us-west-rack2"`,
+			Description: `[DEPRECATED] name of the location of the server e.g. "us-west-rack2"`,
 			Optional:    true,
 		},
 		HelpKV{
@@ -66,3 +91,12 @@ var (
 		},
 	}
 )
+
+// DefaultHelpPostfix - Helper function to add (default: $value) messages in config help
+func DefaultHelpPostfix(subsystem KVS, key string) string {
+	val, found := subsystem.Lookup(key)
+	if !found || val == "" {
+		return ""
+	}
+	return " (default: '" + val + "')"
+}

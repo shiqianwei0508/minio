@@ -19,7 +19,6 @@ package cmd
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -27,8 +26,11 @@ import (
 	"io"
 
 	"github.com/minio/highwayhash"
-	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/hash/sha256"
 	"golang.org/x/crypto/blake2b"
+
+	xioutil "github.com/minio/minio/internal/ioutil"
+	"github.com/minio/minio/internal/logger"
 )
 
 // magic HH-256 key as HH-256 hash of the first 100 decimals of π as utf-8 string with a zero key.
@@ -97,12 +99,12 @@ func BitrotAlgorithmFromString(s string) (a BitrotAlgorithm) {
 			return alg
 		}
 	}
-	return
+	return a
 }
 
-func newBitrotWriter(disk StorageAPI, volume, filePath string, length int64, algo BitrotAlgorithm, shardSize int64) io.Writer {
+func newBitrotWriter(disk StorageAPI, origvolume, volume, filePath string, length int64, algo BitrotAlgorithm, shardSize int64) io.Writer {
 	if algo == HighwayHash256S {
-		return newStreamingBitrotWriter(disk, volume, filePath, length, algo, shardSize)
+		return newStreamingBitrotWriter(disk, origvolume, volume, filePath, length, algo, shardSize)
 	}
 	return newWholeBitrotWriter(disk, volume, filePath, algo, shardSize)
 }
@@ -117,19 +119,29 @@ func newBitrotReader(disk StorageAPI, data []byte, bucket string, filePath strin
 // Close all the readers.
 func closeBitrotReaders(rs []io.ReaderAt) {
 	for _, r := range rs {
-		if br, ok := r.(io.Closer); ok {
-			br.Close()
+		if r != nil {
+			if br, ok := r.(io.Closer); ok {
+				br.Close()
+			}
 		}
 	}
 }
 
 // Close all the writers.
-func closeBitrotWriters(ws []io.Writer) {
-	for _, w := range ws {
+func closeBitrotWriters(ws []io.Writer) []error {
+	errs := make([]error, len(ws))
+	for i, w := range ws {
+		if w == nil {
+			errs[i] = errDiskNotFound
+			continue
+		}
 		if bw, ok := w.(io.Closer); ok {
-			bw.Close()
+			errs[i] = bw.Close()
+		} else {
+			errs[i] = nil
 		}
 	}
+	return errs
 }
 
 // Returns hash sum for whole-bitrot, nil for streaming-bitrot.
@@ -172,8 +184,8 @@ func bitrotVerify(r io.Reader, wantSize, partSize int64, algo BitrotAlgorithm, w
 		return errFileCorrupt
 	}
 
-	bufp := xlPoolSmall.Get().(*[]byte)
-	defer xlPoolSmall.Put(bufp)
+	bufp := xioutil.ODirectPoolSmall.Get()
+	defer xioutil.ODirectPoolSmall.Put(bufp)
 
 	for left > 0 {
 		// Read expected hash...
@@ -210,7 +222,7 @@ func bitrotVerify(r io.Reader, wantSize, partSize int64, algo BitrotAlgorithm, w
 // bitrotSelfTest tries to catch any issue in the bitrot implementation
 // early instead of silently corrupting data.
 func bitrotSelfTest() {
-	var checksums = map[BitrotAlgorithm]string{
+	checksums := map[BitrotAlgorithm]string{
 		SHA256:          "a7677ff19e0182e4d52e3a3db727804abc82a5818749336369552e54b838b004",
 		BLAKE2b512:      "e519b7d84b1c3c917985f544773a35cf265dcab10948be3550320d156bab612124a5ae2ae5a8c73c0eea360f68b0e28136f26e858756dbfe7375a7389f26c669",
 		HighwayHash256:  "39c0407ed3f01b18d22c85db4aeff11e060ca5f43131b0126731ca197cd42313",

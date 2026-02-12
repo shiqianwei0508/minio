@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/minio/pkg/wildcard"
+	"github.com/minio/pkg/v3/wildcard"
 )
 
 // DestinationARNPrefix - destination ARN prefix as per AWS S3 specification.
@@ -37,7 +37,7 @@ type Destination struct {
 	Bucket       string   `xml:"Bucket" json:"Bucket"`
 	StorageClass string   `xml:"StorageClass" json:"StorageClass"`
 	ARN          string
-	//EncryptionConfiguration TODO: not needed for MinIO
+	// EncryptionConfiguration TODO: not needed for MinIO
 }
 
 func (d Destination) isValidStorageClass() bool {
@@ -54,17 +54,16 @@ func (d Destination) IsValid() bool {
 
 func (d Destination) String() string {
 	return d.ARN
-
 }
 
-//LegacyArn returns true if arn format has prefix  "arn:aws:s3:::" which was used
-// prior to multi-destination
+// LegacyArn returns true if arn format has prefix "arn:aws:s3:::" which was
+// used prior to multi-destination
 func (d Destination) LegacyArn() bool {
 	return strings.HasPrefix(d.ARN, DestinationARNPrefix)
 }
 
-//TargetArn returns true if arn format has prefix  "arn:minio:replication:::" used
-// for multi-destination targets
+// TargetArn returns true if arn format has prefix  "arn:minio:replication:::"
+// used for multi-destination targets
 func (d Destination) TargetArn() bool {
 	return strings.HasPrefix(d.ARN, DestinationARNMinIOPrefix)
 }

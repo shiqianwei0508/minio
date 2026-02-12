@@ -41,7 +41,7 @@ type Erasure struct {
 // NewErasure creates a new ErasureStorage.
 func NewErasure(ctx context.Context, dataBlocks, parityBlocks int, blockSize int64) (e Erasure, err error) {
 	// Check the parameters for sanity now.
-	if dataBlocks <= 0 || parityBlocks <= 0 {
+	if dataBlocks <= 0 || parityBlocks < 0 {
 		return e, reedsolomon.ErrInvShardNum
 	}
 
@@ -69,7 +69,7 @@ func NewErasure(ctx context.Context, dataBlocks, parityBlocks int, blockSize int
 		})
 		return enc
 	}
-	return
+	return e, err
 }
 
 // EncodeData encodes the given data and returns the erasure-coded data.
@@ -80,11 +80,9 @@ func (e *Erasure) EncodeData(ctx context.Context, data []byte) ([][]byte, error)
 	}
 	encoded, err := e.encoder().Split(data)
 	if err != nil {
-		logger.LogIf(ctx, err)
 		return nil, err
 	}
 	if err = e.encoder().Encode(encoded); err != nil {
-		logger.LogIf(ctx, err)
 		return nil, err
 	}
 	return encoded, nil
@@ -94,8 +92,8 @@ func (e *Erasure) EncodeData(ctx context.Context, data []byte) ([][]byte, error)
 // It only decodes the data blocks but does not verify them.
 // It returns an error if the decoding failed.
 func (e *Erasure) DecodeDataBlocks(data [][]byte) error {
-	var isZero = 0
-	for _, b := range data[:] {
+	isZero := 0
+	for _, b := range data {
 		if len(b) == 0 {
 			isZero++
 			break
@@ -111,11 +109,7 @@ func (e *Erasure) DecodeDataBlocks(data [][]byte) error {
 // DecodeDataAndParityBlocks decodes the given erasure-coded data and verifies it.
 // It returns an error if the decoding failed.
 func (e *Erasure) DecodeDataAndParityBlocks(ctx context.Context, data [][]byte) error {
-	if err := e.encoder().Reconstruct(data); err != nil {
-		logger.LogIf(ctx, err)
-		return err
-	}
-	return nil
+	return e.encoder().Reconstruct(data)
 }
 
 // ShardSize - returns actual shared size from erasure blockSize.
@@ -142,10 +136,7 @@ func (e *Erasure) ShardFileOffset(startOffset, length, totalLength int64) int64 
 	shardSize := e.ShardSize()
 	shardFileSize := e.ShardFileSize(totalLength)
 	endShard := (startOffset + length) / e.blockSize
-	tillOffset := endShard*shardSize + shardSize
-	if tillOffset > shardFileSize {
-		tillOffset = shardFileSize
-	}
+	tillOffset := min(endShard*shardSize+shardSize, shardFileSize)
 	return tillOffset
 }
 
@@ -207,7 +198,6 @@ func erasureSelfTest() {
 				ok = false
 				continue
 			}
-
 		}
 	}
 	if !ok {

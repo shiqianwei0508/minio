@@ -18,7 +18,10 @@
 package logger
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"regexp"
 	"runtime"
 
@@ -28,8 +31,8 @@ import (
 var ansiRE = regexp.MustCompile("(\x1b[^m]*m)")
 
 // Print ANSI Control escape
-func ansiEscape(format string, args ...interface{}) {
-	var Esc = "\x1b"
+func ansiEscape(format string, args ...any) {
+	Esc := "\x1b"
 	fmt.Printf("%s%s", Esc, fmt.Sprintf(format, args...))
 }
 
@@ -58,5 +61,9 @@ func ansiRestoreAttributes() {
 	if color.IsTerminal() {
 		ansiEscape("8")
 	}
+}
 
+// logIgnoreError if true,the error will ignore.
+func logIgnoreError(err error) bool {
+	return err == nil || errors.Is(err, context.Canceled) || errors.Is(err, http.ErrServerClosed) || err.Error() == "drive not found"
 }

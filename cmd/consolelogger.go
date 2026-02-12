@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -18,24 +18,31 @@
 package cmd
 
 import (
-	ring "container/ring"
+	"container/ring"
 	"context"
+	"io"
 	"sync"
+	"sync/atomic"
 
+	"github.com/minio/madmin-go/v3"
+	"github.com/minio/madmin-go/v3/logger/log"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/logger/message/log"
 	"github.com/minio/minio/internal/logger/target/console"
+	types "github.com/minio/minio/internal/logger/target/loggertypes"
 	"github.com/minio/minio/internal/pubsub"
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // number of log messages to buffer
 const defaultLogBufferCount = 10000
 
-//HTTPConsoleLoggerSys holds global console logger state
+// HTTPConsoleLoggerSys holds global console logger state
 type HTTPConsoleLoggerSys struct {
+	totalMessages  int64
+	failedMessages int64
+
 	sync.RWMutex
-	pubsub   *pubsub.PubSub
+	pubsub   *pubsub.PubSub[log.Info, madmin.LogMask]
 	console  *console.Target
 	nodeName string
 	logBuf   *ring.Ring
@@ -43,13 +50,17 @@ type HTTPConsoleLoggerSys struct {
 
 // NewConsoleLogger - creates new HTTPConsoleLoggerSys with all nodes subscribed to
 // the console logging pub sub system
-func NewConsoleLogger(ctx context.Context) *HTTPConsoleLoggerSys {
-	ps := pubsub.New()
+func NewConsoleLogger(ctx context.Context, w io.Writer) *HTTPConsoleLoggerSys {
 	return &HTTPConsoleLoggerSys{
-		pubsub:  ps,
-		console: console.New(),
+		pubsub:  pubsub.New[log.Info, madmin.LogMask](8),
+		console: console.New(w),
 		logBuf:  ring.New(defaultLogBufferCount),
 	}
+}
+
+// IsOnline always true in case of console logger
+func (sys *HTTPConsoleLoggerSys) IsOnline(_ context.Context) bool {
+	return true
 }
 
 // SetNodeName - sets the node name if any after distributed setup has initialized
@@ -70,14 +81,14 @@ func (sys *HTTPConsoleLoggerSys) SetNodeName(nodeName string) {
 // HasLogListeners returns true if console log listeners are registered
 // for this node or peers
 func (sys *HTTPConsoleLoggerSys) HasLogListeners() bool {
-	return sys != nil && sys.pubsub.NumSubscribers() > 0
+	return sys != nil && sys.pubsub.Subscribers() > 0
 }
 
 // Subscribe starts console logging for this node.
-func (sys *HTTPConsoleLoggerSys) Subscribe(subCh chan interface{}, doneCh <-chan struct{}, node string, last int, logKind string, filter func(entry interface{}) bool) {
+func (sys *HTTPConsoleLoggerSys) Subscribe(subCh chan log.Info, doneCh <-chan struct{}, node string, last int, logKind madmin.LogMask, filter func(entry log.Info) bool) error {
 	// Enable console logging for remote client.
 	if !sys.HasLogListeners() {
-		logger.AddTarget(sys)
+		logger.AddSystemTarget(GlobalContext, sys)
 	}
 
 	cnt := 0
@@ -90,7 +101,7 @@ func (sys *HTTPConsoleLoggerSys) Subscribe(subCh chan interface{}, doneCh <-chan
 
 	lastN = make([]log.Info, last)
 	sys.RLock()
-	sys.logBuf.Do(func(p interface{}) {
+	sys.logBuf.Do(func(p any) {
 		if p != nil {
 			lg, ok := p.(log.Info)
 			if ok && lg.SendLog(node, logKind) {
@@ -102,7 +113,7 @@ func (sys *HTTPConsoleLoggerSys) Subscribe(subCh chan interface{}, doneCh <-chan
 	sys.RUnlock()
 	// send last n console log messages in order filtered by node
 	if cnt > 0 {
-		for i := 0; i < last; i++ {
+		for i := range last {
 			entry := lastN[(cnt+i)%last]
 			if (entry == log.Info{}) {
 				continue
@@ -110,15 +121,15 @@ func (sys *HTTPConsoleLoggerSys) Subscribe(subCh chan interface{}, doneCh <-chan
 			select {
 			case subCh <- entry:
 			case <-doneCh:
-				return
+				return nil
 			}
 		}
 	}
-	sys.pubsub.Subscribe(subCh, doneCh, filter)
+	return sys.pubsub.Subscribe(madmin.LogMaskAll, subCh, doneCh, filter)
 }
 
 // Init if HTTPConsoleLoggerSys is valid, always returns nil right now
-func (sys *HTTPConsoleLoggerSys) Init() error {
+func (sys *HTTPConsoleLoggerSys) Init(_ context.Context) error {
 	return nil
 }
 
@@ -129,13 +140,22 @@ func (sys *HTTPConsoleLoggerSys) Endpoint() string {
 
 // String - stringer function for interface compatibility
 func (sys *HTTPConsoleLoggerSys) String() string {
-	return "console+http"
+	return logger.ConsoleLoggerTgt
+}
+
+// Stats returns the target statistics.
+func (sys *HTTPConsoleLoggerSys) Stats() types.TargetStats {
+	return types.TargetStats{
+		TotalMessages:  atomic.LoadInt64(&sys.totalMessages),
+		FailedMessages: atomic.LoadInt64(&sys.failedMessages),
+		QueueLength:    0,
+	}
 }
 
 // Content returns the console stdout log
 func (sys *HTTPConsoleLoggerSys) Content() (logs []log.Entry) {
 	sys.RLock()
-	sys.logBuf.Do(func(p interface{}) {
+	sys.logBuf.Do(func(p any) {
 		if p != nil {
 			lg, ok := p.(log.Info)
 			if ok {
@@ -147,19 +167,29 @@ func (sys *HTTPConsoleLoggerSys) Content() (logs []log.Entry) {
 	})
 	sys.RUnlock()
 
-	return
+	return logs
+}
+
+// Cancel - cancels the target
+func (sys *HTTPConsoleLoggerSys) Cancel() {
+}
+
+// Type - returns type of the target
+func (sys *HTTPConsoleLoggerSys) Type() types.TargetType {
+	return types.TargetConsole
 }
 
 // Send log message 'e' to console and publish to console
 // log pubsub system
-func (sys *HTTPConsoleLoggerSys) Send(e interface{}, logKind string) error {
+func (sys *HTTPConsoleLoggerSys) Send(ctx context.Context, entry any) error {
 	var lg log.Info
-	switch e := e.(type) {
+	switch e := entry.(type) {
 	case log.Entry:
 		lg = log.Info{Entry: e, NodeName: sys.nodeName}
 	case string:
 		lg = log.Info{ConsoleMsg: e, NodeName: sys.nodeName}
 	}
+	atomic.AddInt64(&sys.totalMessages, 1)
 
 	sys.pubsub.Publish(lg)
 	sys.Lock()
@@ -167,6 +197,9 @@ func (sys *HTTPConsoleLoggerSys) Send(e interface{}, logKind string) error {
 	sys.logBuf.Value = lg
 	sys.logBuf = sys.logBuf.Next()
 	sys.Unlock()
-
-	return sys.console.Send(e, string(logger.All))
+	err := sys.console.Send(entry)
+	if err != nil {
+		atomic.AddInt64(&sys.failedMessages, 1)
+	}
+	return err
 }

@@ -19,8 +19,6 @@ package config
 
 import (
 	"testing"
-
-	"github.com/minio/madmin-go"
 )
 
 func TestKVFields(t *testing.T) {
@@ -90,9 +88,8 @@ func TestKVFields(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		test := test
 		t.Run("", func(t *testing.T) {
-			gotFields := madmin.KvFields(test.input, test.keys)
+			gotFields := kvFields(test.input, test.keys)
 			if len(gotFields) != len(test.expectedFields) {
 				t.Errorf("Expected keys %d, found %d", len(test.expectedFields), len(gotFields))
 			}

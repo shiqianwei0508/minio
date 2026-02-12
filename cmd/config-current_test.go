@@ -26,7 +26,10 @@ import (
 )
 
 func TestServerConfig(t *testing.T) {
-	objLayer, fsDir, err := prepareFS()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	objLayer, fsDir, err := prepareFS(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,26 +39,29 @@ func TestServerConfig(t *testing.T) {
 		t.Fatalf("Init Test config failed")
 	}
 
-	if globalServerRegion != globalMinioDefaultRegion {
-		t.Errorf("Expecting region `us-east-1` found %s", globalServerRegion)
+	if globalSite.Region() != globalMinioDefaultRegion {
+		t.Errorf("Expecting region `us-east-1` found %s", globalSite.Region())
 	}
 
 	// Set new region and verify.
 	config.SetRegion(globalServerConfig, "us-west-1")
-	region, err := config.LookupRegion(globalServerConfig[config.RegionSubSys][config.Default])
+	site, err := config.LookupSite(
+		globalServerConfig[config.SiteSubSys][config.Default],
+		globalServerConfig[config.RegionSubSys][config.Default],
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if region != "us-west-1" {
-		t.Errorf("Expecting region `us-west-1` found %s", globalServerRegion)
+	if site.Region() != "us-west-1" {
+		t.Errorf("Expecting region `us-west-1` found %s", globalSite.Region())
 	}
 
-	if err := saveServerConfig(context.Background(), objLayer, globalServerConfig); err != nil {
+	if err := saveServerConfig(t.Context(), objLayer, globalServerConfig); err != nil {
 		t.Fatalf("Unable to save updated config file %s", err)
 	}
 
 	// Initialize server config.
-	if err := loadConfig(objLayer); err != nil {
+	if err := loadConfig(objLayer, nil); err != nil {
 		t.Fatalf("Unable to initialize from updated config file %s", err)
 	}
 }

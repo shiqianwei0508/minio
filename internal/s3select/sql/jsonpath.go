@@ -20,21 +20,21 @@ package sql
 import (
 	"errors"
 
-	"github.com/bcicen/jstream"
+	"github.com/minio/minio/internal/s3select/jstream"
 	"github.com/minio/simdjson-go"
 )
 
 var (
-	errKeyLookup                 = errors.New("Cannot look up key in non-object value")
-	errIndexLookup               = errors.New("Cannot look up array index in non-array value")
-	errWildcardObjectLookup      = errors.New("Object wildcard used on non-object value")
-	errWildcardArrayLookup       = errors.New("Array wildcard used on non-array value")
-	errWilcardObjectUsageInvalid = errors.New("Invalid usage of object wildcard")
+	errKeyLookup                  = errors.New("Cannot look up key in non-object value")
+	errIndexLookup                = errors.New("Cannot look up array index in non-array value")
+	errWildcardObjectLookup       = errors.New("Object wildcard used on non-object value")
+	errWildcardArrayLookup        = errors.New("Array wildcard used on non-array value")
+	errWildcardObjectUsageInvalid = errors.New("Invalid usage of object wildcard")
 )
 
 // jsonpathEval evaluates a JSON path and returns the value at the path.
 // If the value should be considered flat (from wildcards) any array returned should be considered individual values.
-func jsonpathEval(p []*JSONPathElement, v interface{}) (r interface{}, flat bool, err error) {
+func jsonpathEval(p []*JSONPathElement, v any) (r any, flat bool, err error) {
 	// fmt.Printf("JPATHexpr: %v jsonobj: %v\n\n", p, v)
 	if len(p) == 0 || v == nil {
 		return v, false, nil
@@ -52,12 +52,12 @@ func jsonpathEval(p []*JSONPathElement, v interface{}) (r interface{}, flat bool
 				}
 			}
 			// Key not found - return nil result
-			return nil, false, nil
+			return Missing{}, false, nil
 		case simdjson.Object:
 			elem := kvs.FindKey(key, nil)
 			if elem == nil {
 				// Key not found - return nil result
-				return nil, false, nil
+				return Missing{}, false, nil
 			}
 			val, err := IterToValue(elem.Iter)
 			if err != nil {
@@ -71,7 +71,7 @@ func jsonpathEval(p []*JSONPathElement, v interface{}) (r interface{}, flat bool
 	case p[0].Index != nil:
 		idx := *p[0].Index
 
-		arr, ok := v.([]interface{})
+		arr, ok := v.([]any)
 		if !ok {
 			return nil, false, errIndexLookup
 		}
@@ -85,13 +85,13 @@ func jsonpathEval(p []*JSONPathElement, v interface{}) (r interface{}, flat bool
 		switch kvs := v.(type) {
 		case jstream.KVS:
 			if len(p[1:]) > 0 {
-				return nil, false, errWilcardObjectUsageInvalid
+				return nil, false, errWildcardObjectUsageInvalid
 			}
 
 			return kvs, false, nil
 		case simdjson.Object:
 			if len(p[1:]) > 0 {
-				return nil, false, errWilcardObjectUsageInvalid
+				return nil, false, errWildcardObjectUsageInvalid
 			}
 
 			return kvs, false, nil
@@ -100,14 +100,14 @@ func jsonpathEval(p []*JSONPathElement, v interface{}) (r interface{}, flat bool
 		}
 
 	case p[0].ArrayWildcard:
-		arr, ok := v.([]interface{})
+		arr, ok := v.([]any)
 		if !ok {
 			return nil, false, errWildcardArrayLookup
 		}
 
 		// Lookup remainder of path in each array element and
 		// make result array.
-		var result []interface{}
+		var result []any
 		for _, a := range arr {
 			rval, flatten, err := jsonpathEval(p[1:], a)
 			if err != nil {
@@ -116,7 +116,7 @@ func jsonpathEval(p []*JSONPathElement, v interface{}) (r interface{}, flat bool
 
 			if flatten {
 				// Flatten if array.
-				if arr, ok := rval.([]interface{}); ok {
+				if arr, ok := rval.([]any); ok {
 					result = append(result, arr...)
 					continue
 				}

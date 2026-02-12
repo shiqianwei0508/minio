@@ -1,5 +1,5 @@
 /*
- * MinIO Object Storage (c) 2021 MinIO, Inc.
+ * MinIO Object Storage (c) 2021-2023 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,21 +17,24 @@
 package target
 
 import (
-	"crypto/sha256"
 	"crypto/sha512"
+	"strings"
 
-	"github.com/Shopify/sarama"
+	"github.com/IBM/sarama"
 	"github.com/xdg/scram"
+
+	"github.com/minio/minio/internal/hash/sha256"
 )
 
 func initScramClient(args KafkaArgs, config *sarama.Config) {
-	if args.SASL.Mechanism == "sha512" {
+	switch strings.ToLower(args.SASL.Mechanism) {
+	case "sha512":
 		config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: KafkaSHA512} }
 		config.Net.SASL.Mechanism = sarama.SASLMechanism(sarama.SASLTypeSCRAMSHA512)
-	} else if args.SASL.Mechanism == "sha256" {
+	case "sha256":
 		config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: KafkaSHA256} }
 		config.Net.SASL.Mechanism = sarama.SASLMechanism(sarama.SASLTypeSCRAMSHA256)
-	} else {
+	default:
 		// default to PLAIN
 		config.Net.SASL.Mechanism = sarama.SASLMechanism(sarama.SASLTypePlaintext)
 	}
@@ -59,11 +62,11 @@ type XDGSCRAMClient struct {
 // and authzID via the SASLprep algorithm, as recommended by RFC-5802.  If
 // SASLprep fails, the method returns an error.
 func (x *XDGSCRAMClient) Begin(userName, password, authzID string) (err error) {
-	x.Client, err = x.HashGeneratorFcn.NewClient(userName, password, authzID)
+	x.Client, err = x.NewClient(userName, password, authzID)
 	if err != nil {
 		return err
 	}
-	x.ClientConversation = x.Client.NewConversation()
+	x.ClientConversation = x.NewConversation()
 	return nil
 }
 
@@ -74,7 +77,7 @@ func (x *XDGSCRAMClient) Begin(userName, password, authzID string) (err error) {
 // completes is also an error.
 func (x *XDGSCRAMClient) Step(challenge string) (response string, err error) {
 	response, err = x.ClientConversation.Step(challenge)
-	return
+	return response, err
 }
 
 // Done returns true if the conversation is completed or has errored.

@@ -17,20 +17,15 @@
 
 package event
 
+import "maps"
+
 // TargetIDSet - Set representation of TargetIDs.
 type TargetIDSet map[TargetID]struct{}
-
-// IsEmpty returns true if the set is empty.
-func (set TargetIDSet) IsEmpty() bool {
-	return len(set) != 0
-}
 
 // Clone - returns copy of this set.
 func (set TargetIDSet) Clone() TargetIDSet {
 	setCopy := NewTargetIDSet()
-	for k, v := range set {
-		setCopy[k] = v
-	}
+	maps.Copy(setCopy, set)
 	return setCopy
 }
 
@@ -50,7 +45,7 @@ func (set TargetIDSet) Union(sset TargetIDSet) TargetIDSet {
 	return nset
 }
 
-// Difference - returns diffrence with given set as new set.
+// Difference - returns difference with given set as new set.
 func (set TargetIDSet) Difference(sset TargetIDSet) TargetIDSet {
 	nset := NewTargetIDSet()
 	for k := range set {

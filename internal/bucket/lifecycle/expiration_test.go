@@ -57,7 +57,6 @@ func TestInvalidExpiration(t *testing.T) {
 				t.Fatalf("%d: Expected %v but got %v", i+1, tc.expectedErr, err)
 			}
 		})
-
 	}
 
 	validationTestCases := []struct {
@@ -94,6 +93,20 @@ func TestInvalidExpiration(t *testing.T) {
 			            <ExpiredObjectDeleteMarker>false</ExpiredObjectDeleteMarker>
                                     </Expiration>`,
 			expectedErr: errLifecycleInvalidDeleteMarker,
+		},
+		{ // Expiration with a valid number of days and ExpiredObjectAllVersions
+			inputXML: `<Expiration>
+									<Days>3</Days>
+			            <ExpiredObjectAllVersions>true</ExpiredObjectAllVersions>
+                                    </Expiration>`,
+			expectedErr: nil,
+		},
+		{ // Expiration with a valid ISO 8601 date and ExpiredObjectAllVersions
+			inputXML: `<Expiration>
+									<Date>2019-04-20T00:00:00Z</Date>
+			            <ExpiredObjectAllVersions>true</ExpiredObjectAllVersions>
+                                    </Expiration>`,
+			expectedErr: errLifecycleInvalidDeleteAll,
 		},
 	}
 	for i, tc := range validationTestCases {

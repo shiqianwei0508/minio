@@ -32,7 +32,7 @@ var replicatedInfosTests = []struct {
 	expectedOpType                    replication.Type
 	expectedAction                    replicationAction
 }{
-	{ //1. empty tgtInfos slice
+	{ // 1. empty tgtInfos slice
 		name:                              "no replicated targets",
 		tgtInfos:                          []replicatedTargetInfo{},
 		expectedCompletedSize:             0,
@@ -41,7 +41,7 @@ var replicatedInfosTests = []struct {
 		expectedOpType:                    replication.UnsetReplicationType,
 		expectedAction:                    replicateNone,
 	},
-	{ //2. replication completed to single target
+	{ // 2. replication completed to single target
 		name: "replication completed to single target",
 		tgtInfos: []replicatedTargetInfo{
 			{
@@ -59,7 +59,7 @@ var replicatedInfosTests = []struct {
 		expectedOpType:                    replication.ObjectReplicationType,
 		expectedAction:                    replicateAll,
 	},
-	{ //3. replication completed to single target; failed to another
+	{ // 3. replication completed to single target; failed to another
 		name: "replication completed to single target",
 		tgtInfos: []replicatedTargetInfo{
 			{
@@ -77,14 +77,15 @@ var replicatedInfosTests = []struct {
 				ReplicationStatus:     replication.Failed,
 				OpType:                replication.ObjectReplicationType,
 				ReplicationAction:     replicateAll,
-			}},
+			},
+		},
 		expectedCompletedSize:             249,
 		expectedReplicationStatusInternal: "arn1=COMPLETED;arn2=FAILED;",
 		expectedReplicationStatus:         replication.Failed,
 		expectedOpType:                    replication.ObjectReplicationType,
 		expectedAction:                    replicateAll,
 	},
-	{ //4. replication pending on one target; failed to another
+	{ // 4. replication pending on one target; failed to another
 		name: "replication completed to single target",
 		tgtInfos: []replicatedTargetInfo{
 			{
@@ -102,7 +103,8 @@ var replicatedInfosTests = []struct {
 				ReplicationStatus:     replication.Failed,
 				OpType:                replication.ObjectReplicationType,
 				ReplicationAction:     replicateAll,
-			}},
+			},
+		},
 		expectedCompletedSize:             0,
 		expectedReplicationStatusInternal: "arn1=PENDING;arn2=FAILED;",
 		expectedReplicationStatus:         replication.Failed,
@@ -137,7 +139,7 @@ var parseReplicationDecisionTest = []struct {
 	expDsc ReplicateDecision
 	expErr error
 }{
-	{ //1.
+	{ // 1.
 		name: "empty string",
 		dsc:  "",
 		expDsc: ReplicateDecision{
@@ -146,7 +148,7 @@ var parseReplicationDecisionTest = []struct {
 		expErr: nil,
 	},
 
-	{ //2.
+	{ // 2.
 		name:   "replicate decision for one target",
 		dsc:    "arn:minio:replication::id:bucket=true;false;arn:minio:replication::id:bucket;id",
 		expErr: nil,
@@ -156,7 +158,7 @@ var parseReplicationDecisionTest = []struct {
 			},
 		},
 	},
-	{ //3.
+	{ // 3.
 		name:   "replicate decision for multiple targets",
 		dsc:    "arn:minio:replication::id:bucket=true;false;arn:minio:replication::id:bucket;id,arn:minio:replication::id2:bucket=false;true;arn:minio:replication::id2:bucket;id2",
 		expErr: nil,
@@ -167,7 +169,7 @@ var parseReplicationDecisionTest = []struct {
 			},
 		},
 	},
-	{ //4.
+	{ // 4.
 		name:   "invalid format replicate decision for one target",
 		dsc:    "arn:minio:replication::id:bucket:true;false;arn:minio:replication::id:bucket;id",
 		expErr: errInvalidReplicateDecisionFormat,
@@ -181,9 +183,7 @@ var parseReplicationDecisionTest = []struct {
 
 func TestParseReplicateDecision(t *testing.T) {
 	for i, test := range parseReplicationDecisionTest {
-		//dsc, err := parseReplicateDecision(test.dsc)
-		dsc, err := parseReplicateDecision(test.expDsc.String())
-
+		dsc, err := parseReplicateDecision(t.Context(), "bucket", test.expDsc.String())
 		if err != nil {
 			if test.expErr != err {
 				t.Errorf("Test%d (%s): Expected parse error got %t , want %t", i+1, test.name, err, test.expErr)
@@ -208,22 +208,22 @@ var replicationStateTest = []struct {
 	arn       string
 	expStatus replication.StatusType
 }{
-	{ //1. no replication status header
+	{ // 1. no replication status header
 		name:      "no replicated targets",
 		rs:        ReplicationState{},
 		expStatus: replication.StatusType(""),
 	},
-	{ //2. replication status for one target
+	{ // 2. replication status for one target
 		name:      "replication status for one target",
 		rs:        ReplicationState{ReplicationStatusInternal: "arn1=PENDING;", Targets: map[string]replication.StatusType{"arn1": "PENDING"}},
 		expStatus: replication.Pending,
 	},
-	{ //3. replication status for one target - incorrect format
+	{ // 3. replication status for one target - incorrect format
 		name:      "replication status for one target",
 		rs:        ReplicationState{ReplicationStatusInternal: "arn1=PENDING"},
 		expStatus: replication.StatusType(""),
 	},
-	{ //4. replication status for 3 targets, one of them failed
+	{ // 4. replication status for 3 targets, one of them failed
 		name: "replication status for 3 targets - one failed",
 		rs: ReplicationState{
 			ReplicationStatusInternal: "arn1=COMPLETED;arn2=COMPLETED;arn3=FAILED;",
@@ -231,7 +231,7 @@ var replicationStateTest = []struct {
 		},
 		expStatus: replication.Failed,
 	},
-	{ //5. replication status for replica version
+	{ // 5. replication status for replica version
 		name:      "replication status for replica version",
 		rs:        ReplicationState{ReplicationStatusInternal: string(replication.Replica)},
 		expStatus: replication.Replica,

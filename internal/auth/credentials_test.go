@@ -25,7 +25,7 @@ import (
 
 func TestExpToInt64(t *testing.T) {
 	testCases := []struct {
-		exp             interface{}
+		exp             any
 		expectedFailure bool
 	}{
 		{"", true},
@@ -42,7 +42,6 @@ func TestExpToInt64(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run("", func(t *testing.T) {
 			_, err := ExpToInt64(testCase.exp)
 			if err != nil && !testCase.expectedFailure {
@@ -148,11 +147,11 @@ func TestCreateCredentials(t *testing.T) {
 func TestCredentialsEqual(t *testing.T) {
 	cred, err := GetNewCredentials()
 	if err != nil {
-		t.Fatalf("Failed to get a new credential")
+		t.Fatalf("Failed to get a new credential: %v", err)
 	}
 	cred2, err := GetNewCredentials()
 	if err != nil {
-		t.Fatalf("Failed to get a new credential")
+		t.Fatalf("Failed to get a new credential: %v", err)
 	}
 	testCases := []struct {
 		cred           Credentials

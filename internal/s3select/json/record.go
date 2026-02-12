@@ -26,8 +26,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bcicen/jstream"
 	csv "github.com/minio/csvparser"
+	"github.com/minio/minio/internal/s3select/jstream"
 	"github.com/minio/minio/internal/s3select/sql"
 )
 
@@ -76,7 +76,7 @@ func (r *Record) Clone(dst sql.Record) sql.Record {
 
 // Set - sets the value for a column name.
 func (r *Record) Set(name string, value *sql.Value) (sql.Record, error) {
-	var v interface{}
+	var v any
 	if b, ok := value.ToBool(); ok {
 		v = b
 	} else if f, ok := value.ToFloat(); ok {
@@ -89,6 +89,8 @@ func (r *Record) Set(name string, value *sql.Value) (sql.Record, error) {
 		v = s
 	} else if value.IsNull() {
 		v = nil
+	} else if value.IsMissing() {
+		return r, nil
 	} else if b, ok := value.ToBytes(); ok {
 		// This can either be raw json or a CSV value.
 		// Only treat objects and arrays as JSON.
@@ -103,7 +105,7 @@ func (r *Record) Set(name string, value *sql.Value) (sql.Record, error) {
 		return nil, fmt.Errorf("unsupported sql value %v and type %v", value, value.GetTypeString())
 	}
 
-	name = strings.Replace(name, "*", "__ALL__", -1)
+	name = strings.ReplaceAll(name, "*", "__ALL__")
 	r.KVS = append(r.KVS, jstream.KV{Key: name, Value: v})
 	return r, nil
 }
@@ -124,7 +126,7 @@ func (r *Record) WriteCSV(writer io.Writer, opts sql.WriteCSVOpts) error {
 			columnValue = ""
 		case RawJSON:
 			columnValue = string([]byte(val))
-		case []interface{}:
+		case []any:
 			b, err := json.Marshal(val)
 			if err != nil {
 				return err
@@ -149,7 +151,7 @@ func (r *Record) WriteCSV(writer io.Writer, opts sql.WriteCSVOpts) error {
 }
 
 // Raw - returns the underlying representation.
-func (r *Record) Raw() (sql.SelectObjectFormat, interface{}) {
+func (r *Record) Raw() (sql.SelectObjectFormat, any) {
 	return r.SelectFormat, r.KVS
 }
 
@@ -159,7 +161,7 @@ func (r *Record) WriteJSON(writer io.Writer) error {
 }
 
 // Replace the underlying buffer of json data.
-func (r *Record) Replace(k interface{}) error {
+func (r *Record) Replace(k any) error {
 	v, ok := k.(jstream.KVS)
 	if !ok {
 		return fmt.Errorf("cannot replace internal data in json record with type %T", k)

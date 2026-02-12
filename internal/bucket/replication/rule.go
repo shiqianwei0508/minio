@@ -139,7 +139,7 @@ type Rule struct {
 	Destination               Destination               `xml:"Destination" json:"Destination"`
 	SourceSelectionCriteria   SourceSelectionCriteria   `xml:"SourceSelectionCriteria" json:"SourceSelectionCriteria"`
 	Filter                    Filter                    `xml:"Filter" json:"Filter"`
-	ExistingObjectReplication ExistingObjectReplication `xml:"ExistingObjectReplication,omitempty" json:"ExistingObjectReplication,omitempty"`
+	ExistingObjectReplication ExistingObjectReplication `xml:"ExistingObjectReplication,omitempty" json:"ExistingObjectReplication"`
 }
 
 var (
@@ -153,6 +153,7 @@ var (
 	errDeleteReplicationMissing               = Errorf("Delete replication must be specified")
 	errInvalidDeleteReplicationStatus         = Errorf("Delete replication is either enable|disable")
 	errInvalidExistingObjectReplicationStatus = Errorf("Existing object replication status is invalid")
+	errTagsDeleteMarkerReplicationDisallowed  = Errorf("Delete marker replication is not supported if any Tag filter is specified")
 )
 
 // validateID - checks if ID is valid or not.
@@ -238,6 +239,9 @@ func (r Rule) Validate(bucket string, sameTarget bool) error {
 	}
 	if r.Destination.Bucket == bucket && sameTarget {
 		return errDestinationSourceIdentical
+	}
+	if !r.Filter.Tag.IsEmpty() && (r.DeleteMarkerReplication.Status == Enabled) {
+		return errTagsDeleteMarkerReplicationDisallowed
 	}
 	return r.ExistingObjectReplication.Validate()
 }
